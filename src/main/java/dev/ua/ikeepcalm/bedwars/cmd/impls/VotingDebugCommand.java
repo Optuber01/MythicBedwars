@@ -104,7 +104,7 @@ public class VotingDebugCommand {
             return;
         }
 
-        String previous = String.valueOf(plugin.getVotingManager().getMagicMode(arenaName));
+        String previous = previousMode(arenaName);
         plugin.getVotingManager().cleanupArena(arenaName);
         plugin.getVotingManager().setMagicMode(arenaName, mode);
         plugin.getAudit().emitAdmin(sender, "voting.force", AuditOutcome.COMMITTED, null,
@@ -112,6 +112,15 @@ public class VotingDebugCommand {
 
         sender.sendMessage(Component.text("Force set magic mode " + mode + " for arena " + arenaName,
                 mode.isMagicEnabled() ? NamedTextColor.GREEN : NamedTextColor.RED));
+    }
+
+    /** Audit-only read of the mode being replaced; must never stop the force from running. */
+    private String previousMode(String arenaName) {
+        try {
+            return String.valueOf(plugin.getVotingManager().getMagicMode(arenaName));
+        } catch (RuntimeException ignored) {
+            return null;
+        }
     }
 
     private void handleTest(CommandSender sender) {
