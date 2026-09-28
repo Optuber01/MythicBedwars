@@ -3,9 +3,12 @@ package dev.ua.ikeepcalm.bedwars.domain.reward;
 import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
 import dev.ua.ikeepcalm.bedwars.MythicBedwars;
+import dev.ua.ikeepcalm.bedwars.audit.BedwarsAuditEmitter;
 import dev.ua.ikeepcalm.bedwars.domain.reward.model.RewardModel.RewardBundle;
 import dev.ua.ikeepcalm.bedwars.net.transport.RedisClient;
 import dev.ua.ikeepcalm.bedwars.net.transport.RedisKeys;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditRisk;
 
 import java.util.List;
 import java.util.Optional;
@@ -52,11 +55,21 @@ public class RewardQueue {
     }
 
     /**
-     * Queues a bundle for later collection. Does Redis I/O — call off the main thread.
-     *
-     * @return whether it was newly queued; {@code false} means this player was already paid
+     * What happened to an {@link #emit} call.
      */
-    public boolean emit(RewardBundle bundle) {
+    public enum EmitResult {
+        /** Newly queued. */
+        QUEUED,
+        /** This player was already paid for this event; nothing was written. */
+        DUPLICATE,
+        /** Redis was unreachable; nothing was written. */
+        UNAVAILABLE
+    }
+
+    /**
+     * Queues a bundle for later collection. Does Redis I/O — call off the main thread.
+     */
+    public EmitResult emit(RewardBundle bundle) {
         long result = client.evalLong(EMIT,
                 List.of(keys.rewardsGranted(bundle.eventId()), keys.rewardsPending(bundle.playerId())),
                 List.of(bundle.playerId().toString(),
@@ -69,10 +82,10 @@ public class RewardQueue {
             // Redis is down. Nothing was written, so the emit guard is untouched and a later retry
             // (or the reaper) can still pay them.
             plugin.log("Could not queue rewards for {} - Redis unavailable.", bundle.playerName());
-            return false;
+            return EmitResult.UNAVAILABLE;
         }
 
-        return result > 0;
+        return result > 0 ? EmitResult.QUEUED : EmitResult.DUPLICATE;
     }
 
     /**
@@ -100,9 +113,11 @@ public class RewardQueue {
     /**
      * Puts a bundle back at the front, preserving order. Used when the player logs off mid-apply or
      * their inventory could not take the items.
+     *
+     * @return whether Redis accepted it; {@code false} means the bundle is not queued anywhere
      */
-    public void returnToQueue(UUID playerId, RewardBundle bundle) {
-        client.lpush(keys.rewardsPending(playerId), gson.toJson(bundle), config.queueTtlSeconds());
+    public boolean returnToQueue(UUID playerId, RewardBundle bundle) {
+        return client.lpush(keys.rewardsPending(playerId), gson.toJson(bundle), config.queueTtlSeconds());
     }
 
     /**
@@ -117,8 +132,8 @@ public class RewardQueue {
     /**
      * Releases a claim so the bundle can be retried, after a failure that was not the player's fault.
      */
-    public void releaseClaim(UUID playerId, String eventId) {
-        client.delete(keys.rewardsClaimed(playerId, eventId));
+    public boolean releaseClaim(UUID playerId, String eventId) {
+        return client.delete(keys.rewardsClaimed(playerId, eventId));
     }
 
     /**
@@ -157,6 +172,52 @@ public class RewardQueue {
      */
     private void quarantine(String payload, String reason) {
         plugin.log("Quarantining unreadable reward payload ({}).", String.valueOf(reason));
-        client.rpushCapped(keys.rewardsDeadLetter(), payload, 200);
+        boolean parked = client.rpushCapped(keys.rewardsDeadLetter(), payload, 200);
+        try {
+            auditQuarantine(payload, reason, parked);
+        } catch (RuntimeException | LinkageError ignored) {
+            // Audit is best effort.
+        }
+    }
+
+    /**
+     * Records the unreadable payload by hash, never by content. Runs on the drain's async thread,
+     * so it touches no Bukkit state.
+     */
+    private void auditQuarantine(String payload, String reason, boolean parked) {
+        BedwarsAuditEmitter.AuditRow row = BedwarsAuditEmitter.AuditRow.of("reward.dead_letter",
+                        parked ? AuditOutcome.OBSERVED : AuditOutcome.FAILED)
+                .risk(AuditRisk.HIGH)
+                .reason(String.valueOf(reason))
+                .put("payload_sha256", sha256(payload))
+                .put("payload_length", payload == null ? 0 : payload.length())
+                .put("parked", parked);
+        UUID playerId = playerIdOf(payload);
+        if (playerId != null) {
+            row.subject(playerId).put("player_id", playerId);
+        }
+        plugin.getAudit().emit(row);
+    }
+
+    private UUID playerIdOf(String payload) {
+        try {
+            com.google.gson.JsonElement tree = com.google.gson.JsonParser.parseString(payload);
+            if (tree.isJsonObject() && tree.getAsJsonObject().has("playerId")) {
+                return UUID.fromString(tree.getAsJsonObject().get("playerId").getAsString());
+            }
+        } catch (RuntimeException ignored) {
+            // Unparseable is exactly why it is here.
+        }
+        return null;
+    }
+
+    private static String sha256(String payload) {
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(String.valueOf(payload).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(digest);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            return "unavailable";
+        }
     }
 }

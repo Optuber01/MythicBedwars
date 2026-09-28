@@ -2,6 +2,8 @@ package dev.ua.ikeepcalm.bedwars.domain.reward;
 
 import de.marcely.bedwars.api.arena.Arena;
 import dev.ua.ikeepcalm.bedwars.MythicBedwars;
+import dev.ua.ikeepcalm.bedwars.audit.BedwarsAuditEmitter;
+import dev.ua.ikeepcalm.bedwars.audit.RewardAuditFormat;
 import dev.ua.ikeepcalm.bedwars.domain.core.PathwayManager;
 import dev.ua.ikeepcalm.bedwars.domain.reward.MatchContributionTracker.Contribution;
 import dev.ua.ikeepcalm.bedwars.domain.reward.model.RewardModel.RewardBundle;
@@ -9,6 +11,7 @@ import dev.ua.ikeepcalm.bedwars.domain.reward.model.RewardModel.RewardGrant;
 import dev.ua.ikeepcalm.bedwars.domain.reward.model.RewardModel.RewardTier;
 import dev.ua.ikeepcalm.bedwars.net.minigame.EventReservation;
 import dev.ua.ikeepcalm.coi.api.CircleOfImaginationAPI;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
 import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
@@ -77,6 +80,7 @@ public class RewardService {
                             "magic.rewards.denied_small_match", "needed", config.minPlayers()));
             winners.forEach(notify);
             losers.forEach(notify);
+            auditSmallMatch(reservation, arena, winners, losers, quitWinners, quitLosers, matchSize);
             return;
         }
 
@@ -101,16 +105,21 @@ public class RewardService {
         Contribution contribution = tracker.of(arena.getName(), playerId);
 
         Denial denial = denialReason(contribution);
+        String arenaName = arena.getName();
+        boolean isMvp = mvp != null && mvp.getKey().equals(playerId);
+        // Captured on the main thread: the tracker is not read again after the async hop.
+        EmitContext context = new EmitContext(reservation.eventId(), arenaName, playerId, name, won, tie,
+                isMvp, participationRatio(contribution), contribution.kills(), contribution.finalKills(),
+                contribution.bedsBroken(), contribution.actions());
         if (denial != null) {
             plugin.log("No rewards for {}: {}", name, denial.log);
             notifyDenied(playerId, denial);
+            auditEmit(context, AuditOutcome.DENIED, denial.name().toLowerCase(java.util.Locale.ROOT), null);
             return;
         }
 
         double ratio = participationScale(contribution);
         String pathway = eventPathway(playerId);
-        boolean isMvp = mvp != null && mvp.getKey().equals(playerId);
-        String arenaName = arena.getName();
         String today = LocalDate.now(ZoneOffset.UTC).format(DAY);
 
         // The daily count is a Redis read, so it has to leave the round-end tick. Rolling then
@@ -122,6 +131,8 @@ public class RewardService {
                 if (paidToday >= config.dailyDropThreshold()) {
                     plugin.log("No rewards for {}: {} bundles already today.", name, paidToday);
                     notifyDenied(playerId, Denial.DAILY_CAP);
+                    auditEmit(context, AuditOutcome.DENIED, "daily_cap",
+                            row -> row.put("paid_today", paidToday));
                     return;
                 }
 
@@ -141,6 +152,9 @@ public class RewardService {
                 }
 
                 if (grants.isEmpty()) {
+                    auditEmit(context, AuditOutcome.DENIED, "no_grants_rolled",
+                            row -> row.put("paid_today", paidToday)
+                                    .put("participation_only", participationOnly));
                     return;
                 }
 
@@ -156,16 +170,107 @@ public class RewardService {
                         List.copyOf(grants));
 
                 Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
-                    if (!queue.emit(bundle)) {
+                    RewardQueue.EmitResult emitted = queue.emit(bundle);
+                    if (emitted != RewardQueue.EmitResult.QUEUED) {
+                        boolean duplicate = emitted == RewardQueue.EmitResult.DUPLICATE;
+                        auditEmit(context, duplicate ? AuditOutcome.DENIED : AuditOutcome.FAILED,
+                                duplicate ? "already_emitted" : "redis_unavailable",
+                                row -> RewardAuditFormat.describe(row, bundle)
+                                        .put("paid_today", paidToday)
+                                        .put("participation_only", participationOnly));
                         return;
                     }
                     // Only count it once it is genuinely owed, so a duplicate round-end cannot
                     // inflate somebody towards the cap on rewards they were never paid.
                     queue.recordBundleToday(playerId, today);
+                    auditEmit(context, AuditOutcome.COMMITTED, null,
+                            row -> RewardAuditFormat.describe(row, bundle)
+                                    .put("paid_today", paidToday)
+                                    .put("participation_only", participationOnly)
+                                    .put("participation_scale", ratio));
                     Bukkit.getScheduler().runTask(plugin, () -> preview(playerId, bundle));
                 });
             });
         });
+    }
+
+    /**
+     * Plain values describing one player's result, captured on the main thread so an audit row can
+     * be written from any thread.
+     */
+    private record EmitContext(String eventId, String arena, UUID playerId, String playerName,
+                               boolean won, boolean tie, boolean mvp, double participationRatio,
+                               int kills, int finalKills, int bedsBroken, int actions) {
+    }
+
+    /**
+     * Writes a {@code reward.bundle_emitted} row. Touches no Bukkit state, so it is safe on the
+     * async emit thread.
+     */
+    private void auditEmit(EmitContext context, AuditOutcome outcome, String reason,
+                           java.util.function.Consumer<BedwarsAuditEmitter.AuditRow> extra) {
+        try {
+            emitRow(context, outcome, reason, extra);
+        } catch (RuntimeException | LinkageError ignored) {
+            // Audit is best effort and must never affect a payout.
+        }
+    }
+
+    private void emitRow(EmitContext context, AuditOutcome outcome, String reason,
+                         java.util.function.Consumer<BedwarsAuditEmitter.AuditRow> extra) {
+        BedwarsAuditEmitter.AuditRow row = BedwarsAuditEmitter.AuditRow.of("reward.bundle_emitted", outcome)
+                .correlation(BedwarsAuditEmitter.bundleCorrelation(context.eventId(), context.playerId()))
+                .business(context.eventId())
+                .subject(context.playerId())
+                .reason(reason)
+                .put("actor", "system")
+                .put("event_id", context.eventId())
+                .put("player_name", context.playerName())
+                .put("arena", context.arena())
+                .put("won", context.won())
+                .put("tie", context.tie())
+                .put("mvp", context.mvp())
+                .put("participation_ratio", context.participationRatio())
+                .put("kills", context.kills())
+                .put("final_kills", context.finalKills())
+                .put("beds_broken", context.bedsBroken())
+                .put("actions", context.actions());
+        if (extra != null) {
+            extra.accept(row);
+        }
+        plugin.getAudit().emit(row);
+    }
+
+    private void auditSmallMatch(EventReservation reservation, Arena arena, List<Player> winners,
+                                 List<Player> losers, List<UUID> quitWinners, List<UUID> quitLosers,
+                                 int matchSize) {
+        try {
+            emitSmallMatch(reservation, arena, winners, losers, quitWinners, quitLosers, matchSize);
+        } catch (RuntimeException | LinkageError ignored) {
+            // Audit is best effort.
+        }
+    }
+
+    private void emitSmallMatch(EventReservation reservation, Arena arena, List<Player> winners,
+                                List<Player> losers, List<UUID> quitWinners, List<UUID> quitLosers,
+                                int matchSize) {
+        List<UUID> everyone = new ArrayList<>();
+        winners.forEach(player -> everyone.add(player.getUniqueId()));
+        losers.forEach(player -> everyone.add(player.getUniqueId()));
+        everyone.addAll(quitWinners);
+        everyone.addAll(quitLosers);
+        for (UUID playerId : everyone) {
+            plugin.getAudit().emit(BedwarsAuditEmitter.AuditRow.of("reward.bundle_emitted", AuditOutcome.DENIED)
+                    .correlation(BedwarsAuditEmitter.bundleCorrelation(reservation.eventId(), playerId))
+                    .business(reservation.eventId())
+                    .subject(playerId)
+                    .reason("small_match")
+                    .put("actor", "system")
+                    .put("event_id", reservation.eventId())
+                    .put("arena", arena.getName())
+                    .put("match_size", matchSize)
+                    .put("min_players", config.minPlayers()));
+        }
     }
 
     /**
