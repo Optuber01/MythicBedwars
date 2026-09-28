@@ -48,9 +48,13 @@ Gradle, targeting **Java 25**.
 - **Build the jar**: `./gradlew build`
 - **Run a local Paper server**: `./gradlew runServer`
 
-There is **no shadow plugin**. Nothing is bundled into the jar: Jedis, commons-pool2 and sqlite-jdbc
-are resolved at runtime through `libraries:` in `plugin.yml`, and their versions are declared once in
-`build.gradle` and expanded into `plugin.yml` by `processResources`. Bump them together or not at all.
+The only bundled dependency is the shared Mysterria audit client
+(`dev.ua.ikeepcalm.mysterria:audit-client`, resolved from `mavenLocal()`), shaded by the shadow plugin
+and relocated to `dev.ua.ikeepcalm.bedwars.libs.audit`; the plain `jar` task is disabled so exactly one
+jar lands in `build/libs`. Jedis, commons-pool2 and sqlite-jdbc are resolved at runtime through
+`libraries:` in `plugin.yml`, and their versions are declared once in `build.gradle` and expanded into
+`plugin.yml` by `processResources`. Bump them together or not at all. Audit rows are documented in
+`docs/AUDIT_EVENTS.md`.
 
 ---
 
