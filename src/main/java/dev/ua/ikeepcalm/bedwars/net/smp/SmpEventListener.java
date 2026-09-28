@@ -1,8 +1,11 @@
 package dev.ua.ikeepcalm.bedwars.net.smp;
 
 import dev.ua.ikeepcalm.bedwars.MythicBedwars;
+import dev.ua.ikeepcalm.bedwars.audit.BedwarsAuditEmitter;
 import dev.ua.ikeepcalm.bedwars.domain.item.service.SandboxItems;
 import dev.ua.ikeepcalm.bedwars.domain.reward.RewardRedeemer;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditRisk;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -53,11 +56,43 @@ public class SmpEventListener implements Listener {
      * Sequence 4 characteristics were the consequence.
      */
     private void reclaimMatchItems(org.bukkit.entity.Player player) {
-        int stripped = SandboxItems.strip(player);
+        java.util.List<org.bukkit.inventory.ItemStack> removed = new java.util.ArrayList<>();
+        int stripped = SandboxItems.strip(player.getInventory(), removed::add);
         if (stripped > 0) {
             plugin.getLogger().warning("Removed " + stripped + " match-issued item stack(s) from "
                                        + player.getName() + " on arrival. They should not have crossed "
                                        + "the proxy — check for inventory syncing between backends.");
+            auditStripped(player, removed);
+        }
+    }
+
+    /**
+     * One row per join that removed anything, listing every stack. Main thread; never throws.
+     */
+    private void auditStripped(org.bukkit.entity.Player player, java.util.List<org.bukkit.inventory.ItemStack> removed) {
+        try {
+            java.util.StringJoiner materials = new java.util.StringJoiner(",");
+            int total = 0;
+            for (org.bukkit.inventory.ItemStack stack : removed) {
+                materials.add(stack.getType().name() + "x" + stack.getAmount());
+                total += stack.getAmount();
+            }
+            BedwarsAuditEmitter.AuditRow row = BedwarsAuditEmitter.AuditRow.of("item.sandbox_stripped",
+                            AuditOutcome.COMMITTED)
+                    .risk(AuditRisk.HIGH)
+                    .subject(player.getUniqueId())
+                    .put("actor", "system")
+                    .put("player_name", player.getName())
+                    .put("stack_count", removed.size())
+                    .put("item_count", total)
+                    .put("materials_list", materials.toString());
+            BedwarsAuditEmitter.putLocation(row.metadata(), player.getLocation());
+            if (removed.size() == 1) {
+                BedwarsAuditEmitter.putItem(row.metadata(), removed.getFirst());
+            }
+            plugin.getAudit().emit(row);
+        } catch (RuntimeException | LinkageError ignored) {
+            // Audit is best effort.
         }
     }
 }

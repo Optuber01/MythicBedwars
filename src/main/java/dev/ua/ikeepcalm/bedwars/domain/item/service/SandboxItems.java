@@ -86,17 +86,30 @@ public class SandboxItems {
      * @return how many stacks were removed
      */
     public static int strip(Inventory inventory) {
-        int removed = 0;
+        return strip(inventory, null);
+    }
+
+    /**
+     * Removes every match-issued item from an inventory, handing each removed stack to
+     * {@code removed} (when given) so the caller can record exactly what went.
+     *
+     * @return how many stacks were removed
+     */
+    public static int strip(Inventory inventory, java.util.function.Consumer<ItemStack> removed) {
+        int count = 0;
 
         ItemStack[] contents = inventory.getContents();
         for (int slot = 0; slot < contents.length; slot++) {
             if (isTagged(contents[slot])) {
                 inventory.setItem(slot, null);
-                removed++;
+                count++;
+                if (removed != null) {
+                    removed.accept(contents[slot]);
+                }
             }
         }
 
-        return removed;
+        return count;
     }
 
     /**
