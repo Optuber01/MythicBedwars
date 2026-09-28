@@ -3,6 +3,8 @@ package dev.ua.ikeepcalm.bedwars.cmd;
 import dev.ua.ikeepcalm.bedwars.MythicBedwars;
 import dev.ua.ikeepcalm.bedwars.cmd.impls.EventCommand;
 import dev.ua.ikeepcalm.bedwars.cmd.impls.MinigameSubcommands;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditRisk;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.command.Command;
@@ -107,11 +109,14 @@ public class CommandManager implements CommandExecutor, TabCompleter {
 
     private void handleToggle(CommandSender sender) {
         boolean newState = plugin.getConfigManager().toggleGlobalEnabled();
+        plugin.getAudit().emitAdmin(sender, "toggle", AuditOutcome.COMMITTED, null,
+                row -> row.put("global_enabled", newState).put("role", plugin.getNetworkRole().name()));
         sender.sendMessage(plugin.getLocaleManager().formatMessage(
                 newState ? "magic.commands.global_enabled" : "magic.commands.global_disabled"));
     }
 
     private void handleReload(CommandSender sender) {
+        String rewardsBefore = plugin.getRewardConfig() == null ? null : plugin.getRewardConfig().contentHash();
         plugin.getConfigManager().loadConfig();
         plugin.getLocaleManager().loadLocales();
 
@@ -125,6 +130,13 @@ public class CommandManager implements CommandExecutor, TabCompleter {
         // A repeating task's period is fixed when it is scheduled, so re-reading the config is not
         // enough on its own — anything driven by an interval has to be replaced.
         List<String> rearmed = plugin.reloadScheduledTasks();
+        String rewardsAfter = plugin.getRewardConfig() == null ? null : plugin.getRewardConfig().contentHash();
+        plugin.getAudit().emitAdmin(sender, "reload", AuditOutcome.COMMITTED, null,
+                row -> row.risk(AuditRisk.HIGH).put("role", plugin.getNetworkRole().name())
+                        .put("rewards_sha256_before", rewardsBefore)
+                        .put("rewards_sha256_after", rewardsAfter)
+                        .put("rewards_changed", rewardsBefore != null && !rewardsBefore.equals(rewardsAfter))
+                        .put("tasks_rearmed", String.join(",", rearmed)));
 
         sender.sendMessage(plugin.getLocaleManager().formatMessage("magic.commands.config_reloaded"));
 

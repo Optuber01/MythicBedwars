@@ -1,10 +1,13 @@
 package dev.ua.ikeepcalm.bedwars.cmd.impls;
 
 import dev.ua.ikeepcalm.bedwars.MythicBedwars;
+import dev.ua.ikeepcalm.bedwars.audit.BedwarsAuditEmitter;
 import dev.ua.ikeepcalm.bedwars.net.NetworkService;
 import dev.ua.ikeepcalm.bedwars.net.protocol.Heartbeat;
 import dev.ua.ikeepcalm.bedwars.net.protocol.source.CancelReason;
 import dev.ua.ikeepcalm.bedwars.net.smp.RecruitmentManager;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditRisk;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.Bukkit;
@@ -189,6 +192,13 @@ public class EventCommand {
 
         admin(sender, "Asking for a host (ignoring the quiet period)...", NamedTextColor.GRAY);
         recruitment.propose(true, problem -> {
+            String eventId = recruitment.currentEventId().orElse(null);
+            plugin.getAudit().emitAdmin(sender, "event.start",
+                    problem == null ? AuditOutcome.COMMITTED : AuditOutcome.DENIED, problem,
+                    row -> row.risk(AuditRisk.HIGH).put("ignore_cooldown", true)
+                            .put("event_id", problem == null ? eventId : null)
+                            .correlation(problem == null ? BedwarsAuditEmitter.eventCorrelation(eventId) : null)
+                            .business(problem == null ? eventId : null));
             if (problem == null) {
                 admin(sender, "Offered. Nothing is announced to players until a host accepts.",
                         NamedTextColor.GREEN);
@@ -201,11 +211,27 @@ public class EventCommand {
     private void handleCancel(CommandSender sender) {
         RecruitmentManager recruitment = plugin.getRecruitmentManager();
         if (recruitment != null) {
-            recruitment.cancel(CancelReason.ADMIN, message -> admin(sender, message, NamedTextColor.YELLOW));
+            // Read before cancelling: cancel() works on exactly this id, and clears it when done.
+            String eventId = recruitment.currentEventId().orElse(null);
+            recruitment.cancel(CancelReason.ADMIN, message -> {
+                plugin.getAudit().emitAdmin(sender, "event.cancel",
+                        eventId == null ? AuditOutcome.DENIED : AuditOutcome.COMMITTED,
+                        eventId == null ? "no_event_in_flight" : null,
+                        row -> row.risk(AuditRisk.HIGH).put("role", "smp").put("event_id", eventId)
+                                .correlation(eventId == null ? null : BedwarsAuditEmitter.eventCorrelation(eventId))
+                                .business(eventId));
+                admin(sender, message, NamedTextColor.YELLOW);
+            });
             return;
         }
 
+        String reserved = String.join(",", plugin.getReservedArenaNames());
         int released = plugin.cancelHostedEvents(CancelReason.ADMIN);
+        plugin.getAudit().emitAdmin(sender, "event.cancel",
+                released == 0 ? AuditOutcome.DENIED : AuditOutcome.COMMITTED,
+                released == 0 ? "no_hosted_event" : null,
+                row -> row.risk(AuditRisk.HIGH).put("role", "minigame")
+                        .put("released_arenas", released).put("arenas", reserved));
         if (released == 0) {
             admin(sender, "No event is being hosted here.", NamedTextColor.YELLOW);
         } else {
@@ -232,17 +258,27 @@ public class EventCommand {
 
         Player target = Bukkit.getPlayerExact(args[2]);
         if (target == null) {
+            plugin.getAudit().emitAdmin(sender, "event.send", AuditOutcome.DENIED, "target_offline",
+                    row -> row.put("target_name", args[2]).put("destination_arg", args[3]));
             admin(sender, "Player '" + args[2] + "' is not online here.", NamedTextColor.RED);
             return;
         }
 
         String destination = resolveServerName(args[3]);
         if (destination == null || destination.isBlank()) {
+            plugin.getAudit().emitAdmin(sender, "event.send", AuditOutcome.DENIED, "unknown_destination",
+                    row -> row.target(target.getUniqueId()).put("target_name", target.getName())
+                            .put("destination_arg", args[3]));
             admin(sender, "No Velocity server name is configured for '" + args[3] + "'.", NamedTextColor.RED);
             return;
         }
 
-        if (plugin.getTransferService().transfer(target, destination)) {
+        boolean sent = plugin.getTransferService().transfer(target, destination);
+        plugin.getAudit().emitAdmin(sender, "event.send", sent ? AuditOutcome.COMMITTED : AuditOutcome.FAILED,
+                sent ? null : "transfer_failed",
+                row -> row.risk(AuditRisk.HIGH).target(target.getUniqueId()).put("target_name", target.getName())
+                        .put("destination", destination).put("result", sent ? "transfer_requested" : "transfer_failed"));
+        if (sent) {
             target.sendMessage(plugin.getLocaleManager().formatMessage("magic.event.transferring", "server", destination));
             admin(sender, "Sending " + target.getName() + " to " + destination + "...", NamedTextColor.GREEN);
         } else {

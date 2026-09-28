@@ -6,6 +6,8 @@ import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditProducer;
 import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditRisk;
 import org.bukkit.Location;
 import org.bukkit.NamespacedKey;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Entity;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
@@ -16,6 +18,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 /**
  * Best-effort bridge to the optional shared Mysterria audit ledger.
@@ -87,6 +90,33 @@ public final class BedwarsAuditEmitter implements AutoCloseable {
                     boundedMetadata(row.metadata()));
         } catch (RuntimeException | LinkageError failure) {
             // Audit delivery is best effort and must never gate gameplay or persistence.
+            recordFailure();
+        }
+    }
+
+    /**
+     * Emits a {@code mythicbedwars.admin.command} row for a staff command. Main thread only (reads the
+     * sender). {@code extra} may add fields or raise the risk; nothing it throws escapes.
+     */
+    public void emitAdmin(CommandSender sender, String command, AuditOutcome outcome, String reason,
+                          Consumer<AuditRow> extra) {
+        if (producer == null) {
+            return;
+        }
+        try {
+            AuditRow row = AuditRow.of("admin.command", outcome)
+                    .reason(reason)
+                    .put("command", command);
+            if (sender instanceof Entity entity) {
+                row.actor(entity.getUniqueId()).put("actor", "player");
+            } else {
+                row.put("actor", "console").put("actor_name", sender == null ? null : sender.getName());
+            }
+            if (extra != null) {
+                extra.accept(row);
+            }
+            emit(row);
+        } catch (RuntimeException | LinkageError failure) {
             recordFailure();
         }
     }

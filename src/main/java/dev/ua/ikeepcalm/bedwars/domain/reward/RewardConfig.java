@@ -96,6 +96,26 @@ public class RewardConfig {
         return value == null ? null : String.valueOf(value);
     }
 
+    /** SHA-256 of rewards.yml as last loaded (after backfill), for the reload audit row. */
+    private String contentHash;
+
+    /**
+     * @return the SHA-256 of rewards.yml as it was last loaded, or {@code "unreadable"}
+     */
+    public String contentHash() {
+        return contentHash;
+    }
+
+    private static String hashOf(File file) {
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(java.nio.file.Files.readAllBytes(file.toPath()));
+            return java.util.HexFormat.of().formatHex(digest);
+        } catch (java.io.IOException | java.security.NoSuchAlgorithmException | RuntimeException e) {
+            return "unreadable";
+        }
+    }
+
     public void load() {
         File file = new File(plugin.getDataFolder(), "rewards.yml");
         if (!file.exists()) {
@@ -106,6 +126,7 @@ public class RewardConfig {
 
         // Before the defaults layer goes on, while isSet() still means "actually on disk".
         backfill(file);
+        contentHash = hashOf(file);
 
         // Bundled defaults back the on-disk copy, so a config written before a new key existed still
         // resolves it rather than silently behaving as if the feature were switched off.

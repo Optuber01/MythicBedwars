@@ -5,6 +5,7 @@ import de.marcely.bedwars.api.arena.Arena;
 import dev.ua.ikeepcalm.bedwars.MythicBedwars;
 import dev.ua.ikeepcalm.bedwars.domain.voting.model.MagicMode;
 import dev.ua.ikeepcalm.bedwars.domain.voting.model.VotingSession;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.command.CommandSender;
@@ -88,6 +89,8 @@ public class VotingDebugCommand {
         };
 
         if (mode == null) {
+            plugin.getAudit().emitAdmin(sender, "voting.force", AuditOutcome.DENIED, "unknown_mode",
+                    row -> row.put("arena", arenaName).put("mode_arg", args[3]));
             sender.sendMessage(Component.text("Unknown mode: " + args[3] + " (team, individual or off)",
                     NamedTextColor.RED));
             return;
@@ -95,12 +98,17 @@ public class VotingDebugCommand {
 
         Arena arena = BedwarsAPI.getGameAPI().getArenaByName(arenaName);
         if (arena == null) {
+            plugin.getAudit().emitAdmin(sender, "voting.force", AuditOutcome.DENIED, "arena_not_found",
+                    row -> row.put("arena", arenaName).put("mode", mode.name()));
             sender.sendMessage(Component.text("Arena not found: " + arenaName, NamedTextColor.RED));
             return;
         }
 
+        String previous = String.valueOf(plugin.getVotingManager().getMagicMode(arenaName));
         plugin.getVotingManager().cleanupArena(arenaName);
         plugin.getVotingManager().setMagicMode(arenaName, mode);
+        plugin.getAudit().emitAdmin(sender, "voting.force", AuditOutcome.COMMITTED, null,
+                row -> row.put("arena", arenaName).put("mode", mode.name()).put("previous_mode", previous));
 
         sender.sendMessage(Component.text("Force set magic mode " + mode + " for arena " + arenaName,
                 mode.isMagicEnabled() ? NamedTextColor.GREEN : NamedTextColor.RED));
@@ -130,6 +138,8 @@ public class VotingDebugCommand {
 
         String arenaName = args[2];
         plugin.getVotingManager().cleanupArena(arenaName);
+        plugin.getAudit().emitAdmin(sender, "voting.clear", AuditOutcome.COMMITTED, null,
+                row -> row.put("arena", arenaName));
         sender.sendMessage(Component.text("Cleared voting data for arena: " + arenaName, NamedTextColor.GREEN));
     }
 

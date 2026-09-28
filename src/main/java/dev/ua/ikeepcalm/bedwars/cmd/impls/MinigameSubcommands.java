@@ -3,6 +3,7 @@ package dev.ua.ikeepcalm.bedwars.cmd.impls;
 import de.marcely.bedwars.api.BedwarsAPI;
 import de.marcely.bedwars.api.arena.Arena;
 import dev.ua.ikeepcalm.bedwars.MythicBedwars;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.command.CommandSender;
@@ -190,9 +191,13 @@ public class MinigameSubcommands {
                 if (disabledPathways.remove(pathway)) {
                     plugin.getConfigManager().getConfig().set("pathways.disabled", disabledPathways);
                     plugin.saveConfig();
+                    plugin.getAudit().emitAdmin(sender, "pathways.enable", AuditOutcome.COMMITTED, null,
+                            row -> row.put("pathway", pathway));
                     sender.sendMessage(plugin.getLocaleManager().formatMessage(
                             "magic.commands.pathway_enabled", "pathway", pathway));
                 } else {
+                    plugin.getAudit().emitAdmin(sender, "pathways.enable", AuditOutcome.DENIED, "already_enabled",
+                            row -> row.put("pathway", pathway));
                     sender.sendMessage(plugin.getLocaleManager().formatMessage(
                             "magic.commands.pathway_already_enabled", "pathway", pathway));
                 }
@@ -202,9 +207,13 @@ public class MinigameSubcommands {
                     disabledPathways.add(pathway);
                     plugin.getConfigManager().getConfig().set("pathways.disabled", disabledPathways);
                     plugin.saveConfig();
+                    plugin.getAudit().emitAdmin(sender, "pathways.disable", AuditOutcome.COMMITTED, null,
+                            row -> row.put("pathway", pathway));
                     sender.sendMessage(plugin.getLocaleManager().formatMessage(
                             "magic.commands.pathway_disabled", "pathway", pathway));
                 } else {
+                    plugin.getAudit().emitAdmin(sender, "pathways.disable", AuditOutcome.DENIED, "already_disabled",
+                            row -> row.put("pathway", pathway));
                     sender.sendMessage(plugin.getLocaleManager().formatMessage(
                             "magic.commands.pathway_already_disabled", "pathway", pathway));
                 }
