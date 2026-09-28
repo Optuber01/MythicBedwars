@@ -1,5 +1,6 @@
 package dev.ua.ikeepcalm.bedwars;
 
+import dev.ua.ikeepcalm.bedwars.audit.BedwarsAuditEmitter;
 import dev.ua.ikeepcalm.bedwars.cmd.CommandManager;
 import dev.ua.ikeepcalm.bedwars.cmd.impls.PlayerCommand;
 import dev.ua.ikeepcalm.bedwars.cmd.impls.MinigameSubcommands;
@@ -91,6 +92,7 @@ public final class MythicBedwars extends JavaPlugin {
     private EventReturnService returnService;
     private RewardService rewardService;
     private RewardConfig rewardConfig;
+    private BedwarsAuditEmitter auditEmitter;
 
     public static MythicBedwars getInstance() {
         return instance;
@@ -125,6 +127,14 @@ public final class MythicBedwars extends JavaPlugin {
 
     public RewardService getRewardService() {
         return this.rewardService;
+    }
+
+    /**
+     * @return the audit emitter; never null once {@code onEnable} has started, and a no-op when the
+     * shared audit client is unavailable
+     */
+    public BedwarsAuditEmitter getAudit() {
+        return auditEmitter;
     }
 
     public RewardConfig getRewardConfig() {
@@ -247,6 +257,9 @@ public final class MythicBedwars extends JavaPlugin {
     @Override
     public void onEnable() {
         instance = this;
+
+        // First, so every later subsystem (and an early disable) can rely on it being present.
+        auditEmitter = new BedwarsAuditEmitter(this);
 
         ConfigurationSerialization.registerClass(PathwayStats.class);
 
@@ -688,6 +701,16 @@ public final class MythicBedwars extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        try {
+            shutdownSubsystems();
+        } finally {
+            if (auditEmitter != null) {
+                auditEmitter.close();
+            }
+        }
+    }
+
+    private void shutdownSubsystems() {
         if (eventSyncTask != null) {
             eventSyncTask.cancel();
             eventSyncTask = null;
