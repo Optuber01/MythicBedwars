@@ -144,8 +144,8 @@ back and released its claim, so the next login paid every grant that had already
 time. Now each grant is marked settled as soon as its effect lands. A failure re-queues only the
 unsettled grants, as `<eventId>:retry`, and the original claim is kept, so a stray copy of the
 original can never be applied. For a partly placed stack, only the part that has not been handled
-is owed. Everything else in the redemption path is unchanged, including every player message, its
-order, the overflow and drop policies, and the offline and HOLD requeues.
+is owed. Offline and HOLD requeues also keep their claims and use fresh `:returnN` IDs.
+Player messages, their order, and the overflow and drop policies are unchanged.
 
 ## Overlap policy
 
