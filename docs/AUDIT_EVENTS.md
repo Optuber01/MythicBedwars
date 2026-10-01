@@ -64,6 +64,7 @@ The `result` metadata says what happened:
 | `overflow_requeued` | `CANCELLED` | Whole stacks that did not fit were re-queued as `<eventId>:overflow` (`item-overflow: REQUEUE`). `reason` is `inventory_full`. |
 | `requeue_failed` | `FAILED`, risk `HIGH` | Redis refused the push. The bundle is owed but queued nowhere. `remainder` lists the exact grants to re-issue by hand. |
 | `claim_release_failed` | `FAILED`, risk `HIGH` | Historical row from the previous return-and-release flow. Current requeues keep the original claim and use a fresh id. |
+| `claim_unresolved` | `OBSERVED`, risk `HIGH`, reason `redis_unavailable` | The bundle was popped, but Redis did not confirm its claim. The process retains its grants and owner token for retry. `remainder` records the retained grants. A later row with the same event id resolves the attempt. |
 | `discarded_duplicate` | `DENIED`, risk `HIGH`, reason `already_claimed` | A bundle was polled whose claim already existed, so it was dropped unapplied. This is the "same event id redeemed twice" signal. |
 
 Push results come from Redis, so they are emitted asynchronously once Redis has answered.
@@ -152,3 +153,9 @@ Player messages, their order, and the overflow and drop policies are unchanged.
 Console lines (`plugin.log`) are unchanged and remain the operational diagnostics. The Redis
 pending, granted and claimed keys are transient (30-day TTL); the audit rows are the durable
 record of what was paid.
+
+Unanswered claims retry every 30 seconds while the player is online, or on their next join.
+The same owner token resolves a lost successful response without treating it as another claim.
+At most 256 attempts are retained across all players, with at most one per player. At capacity,
+new bundles stay in Redis until a later redemption has room. Retained attempts are memory-only
+and can be lost on process restart.

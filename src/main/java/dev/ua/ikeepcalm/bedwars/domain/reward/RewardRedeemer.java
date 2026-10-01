@@ -19,6 +19,7 @@ import org.bukkit.Sound;
 import org.bukkit.entity.Item;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.plugin.IllegalPluginAccessException;
 
 import java.util.*;
 
@@ -54,9 +55,28 @@ public class RewardRedeemer {
     /** Appended, with a count, to the event id of a bundle handed back without being applied. */
     static final String RETURN_SUFFIX = ":return";
 
+    /** How long a held bundle waits before its claim is retried, while the player stays online. */
+    private static final long RETRY_DELAY_TICKS = 20L * 30;
+
+    /** Bundles that may sit popped-but-unresolved at once, over all players. */
+    private static final int MAX_UNRESOLVED = 256;
+
     private final MythicBedwars plugin;
     private final RewardConfig config;
     private final RewardQueue queue;
+
+    /**
+     * Bundles popped from Redis whose claim got no answer, one per player at most. Memory only: a
+     * restart before the retry loses them, which is why each is audited with its grants when held.
+     */
+    private final Map<UUID, Unresolved> unresolved = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * One permit per bundle popped and not yet resolved, across all players. Held bundles keep
+     * theirs, so memory stays bounded even when their owners never come back before a restart.
+     */
+    private final java.util.concurrent.Semaphore admission = new java.util.concurrent.Semaphore(MAX_UNRESOLVED);
+    private final Set<UUID> draining = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Set<UUID> retryScheduled = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public RewardRedeemer(MythicBedwars plugin, RewardConfig config, RewardQueue queue) {
         this.plugin = plugin;
@@ -137,21 +157,20 @@ public class RewardRedeemer {
     private void drain(Player player) {
         UUID playerId = player.getUniqueId();
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            // One drain per player at a time, so at most one unresolved bundle is ever held for them.
+            if (!draining.add(playerId)) {
+                return;
+            }
+
             List<RewardBundle> claimed = new ArrayList<>();
+            try {
+                collect(playerId, claimed);
+            } finally {
+                draining.remove(playerId);
+            }
 
-            for (int i = 0; i < config.maxBundlesPerJoin(); i++) {
-                RewardBundle bundle = queue.poll(playerId).orElse(null);
-                if (bundle == null) {
-                    break;
-                }
-
-                // Somebody already applied this one; popping it was the cleanup.
-                if (!queue.claim(playerId, bundle.eventId())) {
-                    auditAlreadyClaimed(bundle);
-                    continue;
-                }
-
-                claimed.add(bundle);
+            if (unresolved.containsKey(playerId)) {
+                scheduleRetry(playerId);
             }
 
             if (claimed.isEmpty()) {
@@ -160,6 +179,96 @@ public class RewardRedeemer {
 
             Bukkit.getScheduler().runTask(plugin, () -> applyClaimed(playerId, claimed));
         });
+    }
+
+    /**
+     * Claims what the player is owed, oldest first: the bundle held from an unanswered claim, then
+     * the queue. Stops at the first claim Redis does not answer, and polls nothing while one is held.
+     */
+    private void collect(UUID playerId, List<RewardBundle> claimed) {
+        int polled = 0;
+        Unresolved held = unresolved.get(playerId);
+        if (held != null) {
+            // Already holds its admission permit, so resolving it never waits on capacity.
+            if (!resolve(playerId, held, claimed)) {
+                return;
+            }
+            unresolved.remove(playerId);
+            admission.release();
+            polled++;
+        }
+
+        for (; polled < config.maxBundlesPerJoin(); polled++) {
+            // At capacity nothing new is popped, so whatever is not admitted stays in Redis.
+            if (!admission.tryAcquire()) {
+                return;
+            }
+
+            boolean kept = false;
+            try {
+                RewardBundle bundle = queue.poll(playerId).orElse(null);
+                if (bundle == null) {
+                    break;
+                }
+
+                Unresolved attempt = new Unresolved(bundle, UUID.randomUUID().toString());
+                if (!resolve(playerId, attempt, claimed)) {
+                    // Already popped, so Redis no longer has it: this copy is the only one until a
+                    // retry with the same token learns whether the claim landed. It keeps the permit.
+                    unresolved.put(playerId, attempt);
+                    kept = true;
+                    auditUnresolved(bundle);
+                    return;
+                }
+            } finally {
+                if (!kept) {
+                    admission.release();
+                }
+            }
+        }
+    }
+
+    /**
+     * @return {@code false} if Redis did not answer, leaving the attempt open
+     */
+    private boolean resolve(UUID playerId, Unresolved attempt, List<RewardBundle> claimed) {
+        RewardQueue.ClaimAttempt result;
+        try {
+            result = queue.claimAttempt(playerId, attempt.bundle().eventId(), attempt.token());
+        } catch (RuntimeException unexpected) {
+            // Whether the claim landed is unknown, exactly as for a missing reply.
+            return false;
+        }
+        switch (result) {
+            case CLAIMED -> claimed.add(attempt.bundle());
+            // Somebody already applied this one; popping it was the cleanup.
+            case DUPLICATE -> auditAlreadyClaimed(attempt.bundle());
+            case UNAVAILABLE -> {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Tries a held bundle again later while the player stays online. Offline players are left to
+     * their next join, which resolves the held bundle before polling anything new.
+     */
+    private void scheduleRetry(UUID playerId) {
+        if (!plugin.isEnabled() || !retryScheduled.add(playerId)) {
+            return;
+        }
+        try {
+            Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                retryScheduled.remove(playerId);
+                Player online = Bukkit.getPlayer(playerId);
+                if (online != null && unresolved.containsKey(playerId)) {
+                    drain(online);
+                }
+            }, RETRY_DELAY_TICKS);
+        } catch (IllegalPluginAccessException disabled) {
+            retryScheduled.remove(playerId);
+        }
     }
 
     private void applyClaimed(UUID playerId, List<RewardBundle> claimed) {
@@ -860,7 +969,28 @@ public class RewardRedeemer {
                 .put("retry", bundle.eventId().contains(":"))));
     }
 
+    /**
+     * A popped bundle held because its claim got no answer. Runs on the drain's async thread; plain
+     * values only. A later row for the same event id settles it; without one, {@code remainder} is owed.
+     */
+    private void auditUnresolved(RewardBundle bundle) {
+        guarded(() -> plugin.getAudit().emit(RewardAuditFormat.describe(
+                        AuditRow.of("reward.bundle_redeemed", AuditOutcome.OBSERVED), bundle)
+                .risk(AuditRisk.HIGH)
+                .reason("redis_unavailable")
+                .put("result", "claim_unresolved")
+                .put("remainder", RewardAuditFormat.grants(bundle.grants()))
+                .put("retry", bundle.eventId().contains(":"))));
+    }
+
     // ---- state --------------------------------------------------------------------------------
+
+    /**
+     * A popped bundle and the token its claim was tried with, so a retry after a lost reply
+     * recognises its own claim.
+     */
+    private record Unresolved(RewardBundle bundle, String token) {
+    }
 
     /**
      * Everything one bundle's apply needs, so the per-grant steps do not each take eight arguments.
