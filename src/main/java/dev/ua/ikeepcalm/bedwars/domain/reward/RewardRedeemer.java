@@ -51,6 +51,9 @@ public class RewardRedeemer {
     /** Appended to the event id of a bundle re-queued after a partial failure. */
     static final String RETRY_SUFFIX = ":retry";
 
+    /** Appended, with a count, to the event id of a bundle handed back without being applied. */
+    static final String RETURN_SUFFIX = ":return";
+
     private final MythicBedwars plugin;
     private final RewardConfig config;
     private final RewardQueue queue;
@@ -882,9 +885,33 @@ public class RewardRedeemer {
     private record Requeue(RewardBundle bundle, boolean releaseClaim, AuditOutcome outcome, String result,
                            String reason, String error, String originalEventId, int settled) {
 
+        /**
+         * Hands the bundle back under a fresh id and keeps the original claim. Releasing the claim
+         * after the push would leave a moment where a concurrent drain pops the pushed copy, finds
+         * the claim still held and discards it as a duplicate.
+         */
         static Requeue untouched(RewardBundle bundle, String reason) {
-            return new Requeue(bundle, true, AuditOutcome.CANCELLED, "requeued", reason, null,
+            RewardBundle returned = new RewardBundle(
+                    RewardBundle.SCHEMA, returnedId(bundle.eventId()), bundle.arena(),
+                    bundle.playerId(), bundle.playerName(), bundle.eventPathway(), bundle.won(),
+                    bundle.earnedAtEpochMs(), bundle.grants());
+            return new Requeue(returned, false, AuditOutcome.CANCELLED, "requeued", reason, null,
                     bundle.eventId(), 0);
+        }
+
+        /**
+         * {@code <id>:return1}, then {@code :return2} and so on: counted rather than appended again,
+         * so a player held at every login does not grow the id without bound.
+         */
+        private static String returnedId(String eventId) {
+            int at = eventId.lastIndexOf(RETURN_SUFFIX);
+            if (at >= 0) {
+                String count = eventId.substring(at + RETURN_SUFFIX.length());
+                if (!count.isEmpty() && count.length() < 10 && count.chars().allMatch(Character::isDigit)) {
+                    return eventId.substring(0, at) + RETURN_SUFFIX + (Integer.parseInt(count) + 1);
+                }
+            }
+            return eventId + RETURN_SUFFIX + 1;
         }
     }
 

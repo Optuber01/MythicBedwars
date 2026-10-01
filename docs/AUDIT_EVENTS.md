@@ -25,7 +25,7 @@ One jar serves both roles (see `CLAUDE.md`). What each row reports depends on wh
 * **Reward rows** use a correlation id derived from `(eventId, playerId)` as
   `UUID.nameUUIDFromBytes("mythicbedwars:bundle:<eventId>:<playerUuid>")`. Anything after the first
   `:` in the event id is stripped first. As a result, the row emitted on #4 and every row written on
-  main for the same player and match share one correlation, and so do the `:overflow` and `:retry`
+  main for the same player and match share one correlation, and so do the `:overflow`, `:retry`, and `:returnN`
   bundles derived from it. `businessId` is the bundle's full event id, including any suffix.
 * **Event rows** (`event.match_finished`, `event.signup`, `admin.command` for `event.start` and
   the SMP `event.cancel`) use `UUID.nameUUIDFromBytes("mythicbedwars:event:<eventId>")`, and their
@@ -59,11 +59,11 @@ The `result` metadata says what happened:
 | --- | --- | --- |
 | `redeemed` | `COMMITTED` | Every grant was applied, placed, dropped or handed to an overflow bundle. Emitted after the last item is handled. |
 | `redeemed_with_error` | `COMMITTED` | Every grant had settled, but an exception was thrown afterwards (for example while formatting the footer message). Carries `error`. |
-| `requeued` | `CANCELLED` | The bundle was pushed back unchanged and its claim was released. `reason` is `offline` (the player logged off between claim and apply) or `held_non_beyonder` (non-Beyonder with `non-beyonder-policy: HOLD`). |
+| `requeued` | `CANCELLED` | The unchanged grants were pushed back under a fresh `<eventId>:returnN` id, and the original claim was kept. `reason` is `offline` (the player logged off between claim and apply) or `held_non_beyonder` (non-Beyonder with `non-beyonder-policy: HOLD`). |
 | `failed_requeued` | `FAILED`, risk `HIGH` | `apply` threw partway. Only the grants that had not landed were re-queued, as a new bundle with id `<eventId>:retry`. Carries `error`, `original_event_id`, `settled` (grants that did land) and `remainder` (the re-queued grants). |
 | `overflow_requeued` | `CANCELLED` | Whole stacks that did not fit were re-queued as `<eventId>:overflow` (`item-overflow: REQUEUE`). `reason` is `inventory_full`. |
 | `requeue_failed` | `FAILED`, risk `HIGH` | Redis refused the push. The bundle is owed but queued nowhere. `remainder` lists the exact grants to re-issue by hand. |
-| `claim_release_failed` | `FAILED`, risk `HIGH` | The push succeeded but the claim could not be released. The next login will discard the bundle as already claimed, so treat `remainder` as owed. |
+| `claim_release_failed` | `FAILED`, risk `HIGH` | Historical row from the previous return-and-release flow. Current requeues keep the original claim and use a fresh id. |
 | `discarded_duplicate` | `DENIED`, risk `HIGH`, reason `already_claimed` | A bundle was polled whose claim already existed, so it was dropped unapplied. This is the "same event id redeemed twice" signal. |
 
 Push results come from Redis, so they are emitted asynchronously once Redis has answered.
@@ -77,14 +77,14 @@ joined with `; `, so a `remainder` can be re-issued exactly.
 
 * **Bundle context** (`bundle_emitted`, `bundle_redeemed`): `player_name`, `arena`,
   `event_pathway`, `won`, `earned_at` (epoch ms), `grant_count`, `grants`, and `retry` (true when
-  the id carries a `:overflow` or `:retry` suffix).
+  the id carries a `:overflow`, `:retry`, or `:returnN` suffix).
 * **`bundle_emitted`**: `tie`, `mvp`, `participation_ratio`, `participation_scale`, `kills`,
   `final_kills`, `beds_broken`, `actions`, `paid_today`, `participation_only`. `small_match` rows
   carry `match_size` and `min_players` instead.
 * **`bundle_redeemed` (`redeemed`)**: `beyonder`, `pathway`, `sequence` (the player's sequence in
   that pathway before redemption), `needed` (acting to the next sequence), `settled`, `dropped`,
   `overflow_requeued`. Requeue rows add `pushed`, `claim_released`, `original_event_id` and
-  `settled`.
+  `settled`. `claim_released=true` also covers requeues that do not require a claim release.
 * **Per-grant rows** (`acting_granted`, `buff_applied`, `item_granted`): `grant_kind`,
   `grant_tier` (`PARTICIPATION`/`WINNER`/`MVP`), `epic`.
 * **`acting_granted`**: `via` (`acting_percent`, `cooldown_unsupported` or `cooldown_ready`, the
