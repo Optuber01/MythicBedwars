@@ -155,16 +155,20 @@ public class RewardRedeemer {
                 return;
             }
 
-            Bukkit.getScheduler().runTask(plugin, () -> applyClaimed(player, playerId, claimed));
+            Bukkit.getScheduler().runTask(plugin, () -> applyClaimed(playerId, claimed));
         });
     }
 
-    private void applyClaimed(Player player, UUID playerId, List<RewardBundle> claimed) {
+    private void applyClaimed(UUID playerId, List<RewardBundle> claimed) {
         // Collected rather than pushed inline: returning a bundle is two Redis round
         // trips, and this block runs on the main thread.
         List<Requeue> giveBack = new ArrayList<>();
 
-        if (!player.isOnline()) {
+        // Resolved now, not taken from the join: isOnline() looks the UUID up, so after a relog
+        // inside the redeem delay the joined Player is a dead session that still reports online,
+        // and items handed to its inventory would vanish with it.
+        Player player = Bukkit.getPlayer(playerId);
+        if (player == null) {
             // Put them back untouched rather than losing them to a badly timed logout.
             claimed.forEach(bundle -> giveBack.add(Requeue.untouched(bundle, "offline")));
         } else {
