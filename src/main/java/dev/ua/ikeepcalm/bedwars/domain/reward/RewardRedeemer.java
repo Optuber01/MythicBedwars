@@ -34,7 +34,9 @@ import java.util.*;
  * always succeeds.
  *
  * <p>Every grant is marked settled the moment its effect lands, so a failure partway through a
- * bundle re-queues exactly the grants that did not land — never the ones that did.
+ * bundle re-queues exactly the grants that did not land — never the ones that did. The one effect
+ * that can fail half-applied, the inventory hand-over, is settled before it runs instead: a grant
+ * that may have landed is never re-queued, at the cost of losing it if it did not.
  */
 public class RewardRedeemer {
 
@@ -666,7 +668,27 @@ public class RewardRedeemer {
             offered[i] = items.get(i).stack().clone();
         }
 
-        Map<Integer, ItemStack> leftovers = player.getInventory().addItem(offered);
+        // Settled before the hand-over, not after. addItem places stack by stack, so if it throws,
+        // any of them may already be in the inventory and there is no telling which. Re-queuing
+        // them would duplicate whatever landed; settling them loses whatever did not. Loss is the
+        // side taken, and the delivery_unknown rows are what an operator reconciles from. Only
+        // leftovers that addItem reports after returning normally are re-opened below.
+        for (PendingItem item : items) {
+            r.progress().settle(item.index());
+        }
+
+        Map<Integer, ItemStack> leftovers;
+        try {
+            leftovers = player.getInventory().addItem(offered);
+        } catch (RuntimeException exception) {
+            String error = exception.getClass().getSimpleName() + ": " + exception.getMessage();
+            for (PendingItem item : items) {
+                auditUnknownDelivery(r, item, error);
+            }
+            plugin.log("Inventory hand-over for {} ({}) failed partway; {} item grant(s) treated as delivered, not retried",
+                    player.getName(), r.bundle().eventId(), items.size());
+            throw exception;
+        }
 
         List<RewardGrant> unplaced = new ArrayList<>();
         List<ItemStack> partial = new ArrayList<>();
@@ -684,6 +706,8 @@ public class RewardRedeemer {
                 placedIndexes.add(i);
                 auditItem(r, item, item.stack(), item.stack().getAmount(), "placed", null);
             } else if (rejected.getAmount() >= item.stack().getAmount()) {
+                // Nothing of it went in, so it is owed again until it is dropped or re-queued.
+                r.progress().reopen(item.index());
                 unplaced.add(item.grant());
                 unplacedIndexes.add(i);
             } else {
@@ -873,6 +897,27 @@ public class RewardRedeemer {
         plugin.getAudit().emit(row);
     }
 
+    /**
+     * An item offered to an inventory hand-over that threw. It is settled and will not be retried,
+     * so {@code remainder} is what the player is owed if it did not actually land.
+     */
+    private void auditUnknownDelivery(Redemption r, PendingItem item, String error) {
+        guarded(() -> {
+            AuditRow row = itemRow(r.bundle(), item.grant(), item.substituted(), AuditOutcome.FAILED)
+                    .risk(AuditRisk.HIGH)
+                    .reason("inventory_add_failed")
+                    .put("result", "delivery_unknown")
+                    .put("error", error);
+            if (item.bottleActing() > 0) {
+                row.put("bottle_acting", item.bottleActing());
+            }
+            BedwarsAuditEmitter.putItem(row.metadata(), item.stack());
+            row.put("amount", item.stack().getAmount())
+                    .put("remainder", RewardAuditFormat.grant(withCount(item.grant(), item.stack().getAmount())));
+            plugin.getAudit().emit(row);
+        });
+    }
+
     private void auditActing(Redemption r, RewardGrant grant, String via, int points, int granted,
                              AuditOutcome outcome, String reason) {
         guarded(() -> plugin.getAudit().emit(grantRow("reward.acting_granted", r.bundle(), grant, outcome)
@@ -1047,7 +1092,8 @@ public class RewardRedeemer {
 
     /**
      * Which grants of one bundle have landed. A grant is settled the moment its effect is applied
-     * (or definitively cannot be), so the remainder after a failure is exactly what is still owed.
+     * (or definitively cannot be), or just before an effect that could land without saying so, so
+     * the remainder after a failure never includes anything that may already have been given.
      */
     private static final class Progress {
         final List<RewardGrant> ordered;
@@ -1071,8 +1117,15 @@ public class RewardRedeemer {
             partialRemainder[index] = null;
         }
 
+        /** Settled ahead of an effect that then turned out not to land; the whole grant is owed. */
+        void reopen(int index) {
+            settled[index] = false;
+            partialRemainder[index] = null;
+        }
+
         /** Part of the grant landed; until the rest is handled, only {@code rest} is still owed. */
         void partial(int index, RewardGrant rest) {
+            settled[index] = false;
             partialRemainder[index] = rest;
         }
 
