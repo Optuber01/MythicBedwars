@@ -38,6 +38,28 @@ public class RewardQueue {
             return redis.call('LLEN', KEYS[2])
             """;
 
+    /**
+     * Claims with an owner token. {@code KEYS[1]} claim marker, {@code ARGV[1]} token,
+     * {@code ARGV[2]} ttl. Returns 1 when claimed now or by an earlier try with the same token,
+     * 0 when anyone else holds it (including markers written by {@link #claim}).
+     */
+    private static final String CLAIM = """
+            local held = redis.call('GET', KEYS[1])
+            if held == ARGV[1] then return 1 end
+            if held then return 0 end
+            redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+            return 1
+            """;
+
+    /** What a {@link #claimAttempt} learned. */
+    enum ClaimAttempt {
+        CLAIMED,
+        /** Somebody else holds the claim; the bundle must be discarded. */
+        DUPLICATE,
+        /** No answer from Redis; whether the claim landed is unknown until retried with the same token. */
+        UNAVAILABLE
+    }
+
     private final MythicBedwars plugin;
     private final RedisClient client;
     private final RedisKeys keys;
@@ -112,6 +134,19 @@ public class RewardQueue {
      */
     public boolean claim(UUID playerId, String eventId) {
         return client.setIfAbsent(keys.rewardsClaimed(playerId, eventId), "1", config.queueTtlSeconds());
+    }
+
+    /**
+     * Like {@link #claim}, but an outage is not mistaken for a duplicate. Retrying with the same
+     * {@code token} after a lost reply finds its own marker and still counts as claimed. Does Redis I/O.
+     */
+    ClaimAttempt claimAttempt(UUID playerId, String eventId, String token) {
+        long result = client.evalLong(CLAIM, List.of(keys.rewardsClaimed(playerId, eventId)),
+                List.of(token, Integer.toString(config.queueTtlSeconds())), -1L);
+        if (result == 1L) {
+            return ClaimAttempt.CLAIMED;
+        }
+        return result == 0L ? ClaimAttempt.DUPLICATE : ClaimAttempt.UNAVAILABLE;
     }
 
     /**

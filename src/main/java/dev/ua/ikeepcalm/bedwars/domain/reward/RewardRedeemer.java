@@ -9,9 +9,11 @@ import dev.ua.ikeepcalm.coi.api.CircleOfImaginationAPI;
 import dev.ua.ikeepcalm.coi.api.model.PathwayData;
 import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.Sound;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.plugin.IllegalPluginAccessException;
 
 import java.util.*;
 
@@ -24,6 +26,11 @@ import java.util.*;
  * silently inflate the very grant it was rolled alongside. Items are last because a full inventory
  * is the one failure that has to be retried, and it must not block the half of the reward that
  * always succeeds.
+ *
+ * <p>Every grant is marked settled the moment its effect lands, so a failure partway through a
+ * bundle re-queues exactly the grants that did not land, never the ones that did. The one effect
+ * that can fail half-applied, the inventory hand-over, is settled before it runs instead: a grant
+ * that may have landed is never re-queued, at the cost of losing it if it did not.
  */
 public class RewardRedeemer {
 
@@ -38,9 +45,34 @@ public class RewardRedeemer {
                 case ITEM -> 2;
             });
 
+    /** Appended to the event id of a bundle re-queued after a partial failure. */
+    static final String RETRY_SUFFIX = ":retry";
+
+    /** Appended, with a count, to the event id of a bundle handed back without being applied. */
+    static final String RETURN_SUFFIX = ":return";
+
+    /** How long a held bundle waits before its claim is retried, while the player stays online. */
+    private static final long RETRY_DELAY_TICKS = 20L * 30;
+
+    /** Bundles that may sit popped-but-unresolved at once, over all players. */
+    private static final int MAX_UNRESOLVED = 256;
+
     private final MythicBedwars plugin;
     private final RewardConfig config;
     private final RewardQueue queue;
+
+    /**
+     * Bundles popped from Redis whose claim got no answer, one per player at most. Memory only: a
+     * restart before the retry loses them.
+     */
+    private final Map<UUID, Unresolved> unresolved = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * One permit per bundle popped and not yet resolved, across all players. Held bundles keep
+     * theirs, so memory stays bounded even when their owners never come back before a restart.
+     */
+    private final java.util.concurrent.Semaphore admission = new java.util.concurrent.Semaphore(MAX_UNRESOLVED);
+    private final Set<UUID> draining = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Set<UUID> retryScheduled = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public RewardRedeemer(MythicBedwars plugin, RewardConfig config, RewardQueue queue) {
         this.plugin = plugin;
@@ -85,6 +117,11 @@ public class RewardRedeemer {
         return new RewardGrant(grant.kind(), grant.tier(), null, amount, 0, 1, null, 9, grant.epic());
     }
 
+    private static RewardGrant withCount(RewardGrant grant, int count) {
+        return new RewardGrant(grant.kind(), grant.tier(), grant.item(), grant.amount(), grant.intArg(),
+                count, grant.strArg(), grant.maxSequence(), grant.epic());
+    }
+
     /**
      * Thousands-separated, because a five-digit acting grant is the payoff line of the whole feature
      * and "+13214" does not read as one.
@@ -114,70 +151,217 @@ public class RewardRedeemer {
     }
 
     private void drain(Player player) {
+        UUID playerId = player.getUniqueId();
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            // One drain per player at a time, so at most one unresolved bundle is ever held for them.
+            if (!draining.add(playerId)) {
+                return;
+            }
+
             List<RewardBundle> claimed = new ArrayList<>();
+            try {
+                collect(playerId, claimed);
+            } finally {
+                draining.remove(playerId);
+            }
 
-            for (int i = 0; i < config.maxBundlesPerJoin(); i++) {
-                RewardBundle bundle = queue.poll(player.getUniqueId()).orElse(null);
-                if (bundle == null) {
-                    break;
-                }
-
-                // Somebody already applied this one; popping it was the cleanup.
-                if (!queue.claim(player.getUniqueId(), bundle.eventId())) {
-                    continue;
-                }
-
-                claimed.add(bundle);
+            if (unresolved.containsKey(playerId)) {
+                scheduleRetry(playerId);
             }
 
             if (claimed.isEmpty()) {
                 return;
             }
 
-            Bukkit.getScheduler().runTask(plugin, () -> {
-                // Collected rather than pushed inline: returning a bundle is two Redis round
-                // trips, and this block runs on the main thread.
-                List<RewardBundle> giveBack = new ArrayList<>();
-
-                if (!player.isOnline()) {
-                    // Put them back untouched rather than losing them to a badly timed logout.
-                    giveBack.addAll(claimed);
-                } else {
-                    for (RewardBundle bundle : claimed) {
-                        try {
-                            apply(player, bundle, giveBack);
-                        } catch (RuntimeException exception) {
-                            // Everything in `claimed` is already popped and claimed, so letting this
-                            // propagate would destroy the bundles after it as well as this one.
-                            plugin.log("Failed to apply rewards for {} ({}): {}",
-                                    player.getName(), bundle.eventId(), String.valueOf(exception.getMessage()));
-                            giveBack.add(bundle);
-                        }
-                    }
-                }
-
-                if (!giveBack.isEmpty()) {
-                    requeue(player.getUniqueId(), giveBack);
-                }
-            });
+            Bukkit.getScheduler().runTask(plugin, () -> applyClaimed(playerId, claimed));
         });
     }
 
     /**
-     * Pushes bundles back, oldest last, so the queue order survives. Each push goes to the head of
-     * the list, hence the reversal.
+     * Claims what the player is owed, oldest first: the bundle held from an unanswered claim, then
+     * the queue. Stops at the first claim Redis does not answer, and polls nothing while one is held.
      */
-    private void requeue(java.util.UUID playerId, List<RewardBundle> bundles) {
+    private void collect(UUID playerId, List<RewardBundle> claimed) {
+        int polled = 0;
+        Unresolved held = unresolved.get(playerId);
+        if (held != null) {
+            // Already holds its admission permit, so resolving it never waits on capacity.
+            if (!resolve(playerId, held, claimed)) {
+                return;
+            }
+            unresolved.remove(playerId);
+            admission.release();
+            polled++;
+        }
+
+        for (; polled < config.maxBundlesPerJoin(); polled++) {
+            // At capacity nothing new is popped, so whatever is not admitted stays in Redis.
+            if (!admission.tryAcquire()) {
+                return;
+            }
+
+            boolean kept = false;
+            try {
+                RewardBundle bundle = queue.poll(playerId).orElse(null);
+                if (bundle == null) {
+                    break;
+                }
+
+                Unresolved attempt = new Unresolved(bundle, UUID.randomUUID().toString());
+                if (!resolve(playerId, attempt, claimed)) {
+                    // Already popped, so Redis no longer has it: this copy is the only one until a
+                    // retry with the same token learns whether the claim landed. It keeps the permit.
+                    unresolved.put(playerId, attempt);
+                    kept = true;
+                    return;
+                }
+            } finally {
+                if (!kept) {
+                    admission.release();
+                }
+            }
+        }
+    }
+
+    /**
+     * @return {@code false} if Redis did not answer, leaving the attempt open
+     */
+    private boolean resolve(UUID playerId, Unresolved attempt, List<RewardBundle> claimed) {
+        RewardQueue.ClaimAttempt result;
+        try {
+            result = queue.claimAttempt(playerId, attempt.bundle().eventId(), attempt.token());
+        } catch (RuntimeException unexpected) {
+            // Whether the claim landed is unknown, exactly as for a missing reply.
+            return false;
+        }
+        switch (result) {
+            case CLAIMED -> claimed.add(attempt.bundle());
+            // Somebody already applied this one; popping it was the cleanup.
+            case DUPLICATE -> {
+            }
+            case UNAVAILABLE -> {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Tries a held bundle again later while the player stays online. Offline players are left to
+     * their next join, which resolves the held bundle before polling anything new.
+     */
+    private void scheduleRetry(UUID playerId) {
+        if (!plugin.isEnabled() || !retryScheduled.add(playerId)) {
+            return;
+        }
+        try {
+            Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                retryScheduled.remove(playerId);
+                Player online = Bukkit.getPlayer(playerId);
+                if (online != null && unresolved.containsKey(playerId)) {
+                    drain(online);
+                }
+            }, RETRY_DELAY_TICKS);
+        } catch (IllegalPluginAccessException disabled) {
+            retryScheduled.remove(playerId);
+        }
+    }
+
+    private void applyClaimed(UUID playerId, List<RewardBundle> claimed) {
+        // Collected rather than pushed inline: returning a bundle is a Redis round trip, and this
+        // block runs on the main thread.
+        List<RewardBundle> giveBack = new ArrayList<>();
+
+        // Resolved now, not taken from the join: isOnline() looks the UUID up, so after a relog
+        // inside the redeem delay the joined Player is a dead session that still reports online,
+        // and items handed to its inventory would vanish with it.
+        Player player = Bukkit.getPlayer(playerId);
+        if (player == null) {
+            // Put them back untouched rather than losing them to a badly timed logout.
+            claimed.forEach(bundle -> giveBack.add(returned(bundle)));
+        } else {
+            for (RewardBundle bundle : claimed) {
+                Progress progress = new Progress(bundle);
+                try {
+                    apply(player, bundle, progress, giveBack);
+                } catch (RuntimeException exception) {
+                    // Everything in `claimed` is already popped and claimed, so letting this
+                    // propagate would destroy the bundles after it as well as this one.
+                    plugin.log("Failed to apply rewards for {} ({}): {}",
+                            player.getName(), bundle.eventId(), String.valueOf(exception.getMessage()));
+                    handleFailure(bundle, progress, giveBack);
+                }
+            }
+        }
+
+        if (!giveBack.isEmpty()) {
+            requeue(playerId, giveBack);
+        }
+    }
+
+    /**
+     * Re-queues only what did not land. The original claim is kept, so a stray copy of the original
+     * bundle can never be applied again; the remainder travels under its own id.
+     */
+    private void handleFailure(RewardBundle bundle, Progress progress, List<RewardBundle> giveBack) {
+        if (progress.handedBack) {
+            // Already on its way back whole (held for a non-Beyonder); queuing it twice would dupe it.
+            return;
+        }
+
+        List<RewardGrant> remainder = progress.remainder();
+        if (remainder.isEmpty()) {
+            // Everything landed; the failure came after the last grant settled.
+            return;
+        }
+
+        giveBack.add(new RewardBundle(
+                RewardBundle.SCHEMA, bundle.eventId() + RETRY_SUFFIX, bundle.arena(),
+                bundle.playerId(), bundle.playerName(), bundle.eventPathway(), bundle.won(),
+                bundle.earnedAtEpochMs(), List.copyOf(remainder)));
+    }
+
+    /**
+     * Hands a bundle back under a fresh id and keeps the original claim. Releasing the claim after
+     * the push would leave a moment where a concurrent drain pops the pushed copy, finds the claim
+     * still held and discards it as a duplicate.
+     */
+    private static RewardBundle returned(RewardBundle bundle) {
+        return new RewardBundle(
+                RewardBundle.SCHEMA, returnedId(bundle.eventId()), bundle.arena(),
+                bundle.playerId(), bundle.playerName(), bundle.eventPathway(), bundle.won(),
+                bundle.earnedAtEpochMs(), bundle.grants());
+    }
+
+    /**
+     * {@code <id>:return1}, then {@code :return2} and so on: counted rather than appended again,
+     * so a player held at every login does not grow the id without bound.
+     */
+    private static String returnedId(String eventId) {
+        int at = eventId.lastIndexOf(RETURN_SUFFIX);
+        if (at >= 0) {
+            String count = eventId.substring(at + RETURN_SUFFIX.length());
+            if (!count.isEmpty() && count.length() < 10 && count.chars().allMatch(Character::isDigit)) {
+                return eventId.substring(0, at) + RETURN_SUFFIX + (Integer.parseInt(count) + 1);
+            }
+        }
+        return eventId + RETURN_SUFFIX + 1;
+    }
+
+    /**
+     * Pushes bundles back, oldest last, so the queue order survives. Each push goes to the head of
+     * the list, hence the reversal. Every bundle here travels under an id of its own, so no claim
+     * needs releasing.
+     */
+    private void requeue(UUID playerId, List<RewardBundle> bundles) {
         plugin.offMainThread(() -> {
             for (RewardBundle bundle : bundles.reversed()) {
                 queue.returnToQueue(playerId, bundle);
-                queue.releaseClaim(playerId, bundle.eventId());
             }
         });
     }
 
-    private void apply(Player player, RewardBundle bundle, List<RewardBundle> giveBack) {
+    private void apply(Player player, RewardBundle bundle, Progress progress, List<RewardBundle> giveBack) {
         CircleOfImaginationAPI api = plugin.getCircleOfImaginationAPI();
         CoiCapabilities capabilities = plugin.getCoiCapabilities();
 
@@ -187,58 +371,54 @@ public class RewardRedeemer {
         // HOLD means exactly that: park the whole bundle until they have somewhere to put it,
         // rather than applying the item half and quietly binning the rest.
         if (!beyonder && !config.substituteForNonBeyonders()) {
-            giveBack.add(bundle);
+            progress.handedBack = true;
+            giveBack.add(returned(bundle));
             player.sendMessage(message(player, "magic.redeem.held_until_awakened"));
             return;
         }
 
         int needed = beyonder ? api.getActingRequiredForNextSequence(player, pathway) : 0;
+        Redemption r = new Redemption(api, capabilities, player, pathway, needed, bundle, progress,
+                new ArrayList<>());
 
-        List<Component> summary = new ArrayList<>();
-        List<ItemStack> items = new ArrayList<>();
-        List<RewardGrant> itemGrants = new ArrayList<>();
+        List<PendingItem> items = new ArrayList<>();
+        List<RewardGrant> ordered = progress.ordered;
 
-        List<RewardGrant> ordered = new ArrayList<>(bundle.grants());
-        ordered.sort(APPLY_ORDER);
-
-        for (RewardGrant grant : ordered) {
+        for (int index = 0; index < ordered.size(); index++) {
+            RewardGrant grant = ordered.get(index);
             switch (grant.kind()) {
                 case ACTING_PERCENT -> {
                     if (beyonder) {
-                        applyActing(api, capabilities, player, pathway, needed, grant, summary);
+                        applyActing(r, index, grant);
                     } else {
-                        substitute(api, items, itemGrants, grant);
+                        substitute(r, items, index, grant);
                     }
                 }
                 case COOLDOWN_CREDIT -> {
                     if (beyonder && capabilities.cooldownCredit()) {
-                        applyCooldown(api, capabilities, player, pathway, needed, grant, summary);
+                        applyCooldown(r, index, grant);
                     } else if (beyonder) {
                         // Older COI cannot credit cooldowns; pay the equivalent in acting instead.
-                        applyActing(api, capabilities, player, pathway, needed,
-                                withAmount(grant, config.cooldownSubstitutePercent()), summary);
+                        applyActing(r, index, withAmount(grant, config.cooldownSubstitutePercent()));
                     } else {
-                        substitute(api, items, itemGrants, grant);
+                        substitute(r, items, index, grant);
                     }
                 }
                 case ACTING_SPEED -> {
                     if (beyonder) {
-                        applySpeed(api, player, grant, summary);
+                        applySpeed(r, index, grant);
                     } else {
-                        substitute(api, items, itemGrants, grant);
+                        substitute(r, items, index, grant);
                     }
                 }
                 case ACTING_ITEM_MULT -> {
                     if (beyonder) {
-                        applyItemMultiplier(api, player, grant, summary);
+                        applyItemMultiplier(r, index, grant);
                     } else {
-                        substitute(api, items, itemGrants, grant);
+                        substitute(r, items, index, grant);
                     }
                 }
-                case ITEM -> buildItem(api, player, needed, grant).ifPresent(stack -> {
-                    items.add(stack);
-                    itemGrants.add(grant);
-                });
+                case ITEM -> buildItem(r, items, index, grant);
             }
         }
 
@@ -253,8 +433,8 @@ public class RewardRedeemer {
             player.sendMessage(message(player, "magic.redeem.not_beyonder"));
         }
 
-        summary.forEach(player::sendMessage);
-        giveItems(player, bundle, items, itemGrants);
+        r.summary().forEach(player::sendMessage);
+        giveItems(r, items);
         player.sendMessage(message(player, "magic.redeem.footer"));
 
         if (ordered.stream().anyMatch(RewardGrant::epic)) {
@@ -262,62 +442,67 @@ public class RewardRedeemer {
         }
     }
 
-    private void applyActing(CircleOfImaginationAPI api, CoiCapabilities capabilities, Player player,
-                             String pathway, int needed, RewardGrant grant, List<Component> summary) {
-        if (needed <= 0) {
+    private void applyActing(Redemption r, int index, RewardGrant grant) {
+        Player player = r.player();
+        if (r.needed() <= 0) {
             // Sequence 0, or an outer pathway that advances by sacrifice rather than acting.
-            summary.add(message(player, "magic.redeem.acting_not_applicable"));
+            r.progress().settle(index);
+            r.summary().add(message(player, "magic.redeem.acting_not_applicable"));
             return;
         }
 
-        int points = (int) Math.round(needed * grant.amount() / 100.0);
+        int points = (int) Math.round(r.needed() * grant.amount() / 100.0);
         if (points <= 0) {
+            r.progress().settle(index);
             return;
         }
 
-        int granted = api.grantActing(player, pathway, capabilities.rewardSource(), points);
+        int granted = r.api().grantActing(player, r.pathway(), r.capabilities().rewardSource(), points);
+        r.progress().settle(index);
         if (granted <= 0) {
             // Say so rather than dropping it silently - a reward that vanishes reads as a bug.
-            summary.add(message(player, "magic.redeem.acting_capped"));
+            r.summary().add(message(player, "magic.redeem.acting_capped"));
             return;
         }
 
         // Report what actually landed, not what was rolled. COI scales a grant by the player's
         // sequence on the way in, so the rolled percentage overstates it at low sequences and
         // understates it at high ones.
-        summary.add(message(player, "magic.redeem.acting_granted",
+        r.summary().add(message(player, "magic.redeem.acting_granted",
                 "amount", number(granted),
-                "percent", percent(granted * 100.0 / needed),
-                "sequence", api.getLowestSequence(player)));
+                "percent", percent(granted * 100.0 / r.needed()),
+                "sequence", r.api().getLowestSequence(player)));
     }
 
-    private void applyCooldown(CircleOfImaginationAPI api, CoiCapabilities capabilities, Player player,
-                               String pathway, int needed, RewardGrant grant, List<Component> summary) {
-        String methodId = api.getActingMethodId(player, pathway);
+    private void applyCooldown(Redemption r, int index, RewardGrant grant) {
+        Player player = r.player();
+        String methodId = r.api().getActingMethodId(player, r.pathway());
         if (methodId == null) {
-            summary.add(message(player, "magic.redeem.acting_not_applicable"));
+            r.progress().settle(index);
+            r.summary().add(message(player, "magic.redeem.acting_not_applicable"));
             return;
         }
 
-        long total = api.getActingMethodCooldownSeconds(methodId);
+        long total = r.api().getActingMethodCooldownSeconds(methodId);
         long seconds = Math.round(total * grant.amount() / 100.0);
         if (seconds <= 0) {
+            r.progress().settle(index);
             return;
         }
 
-        long credited = api.creditActingCooldown(player, methodId, seconds);
+        long credited = r.api().creditActingCooldown(player, methodId, seconds);
         if (credited <= 0) {
             // Their method was already off cooldown, so there was nothing to shave. Paying the
             // acting equivalent instead keeps the largest slice of the loot table from being a
             // coin-flip no-op for anyone who logged off at a natural stopping point.
-            summary.add(message(player, "magic.redeem.cooldown_ready"));
-            applyActing(api, capabilities, player, pathway, needed,
-                    withAmount(grant, config.cooldownSubstitutePercent()), summary);
+            r.summary().add(message(player, "magic.redeem.cooldown_ready"));
+            applyActing(r, index, withAmount(grant, config.cooldownSubstitutePercent()));
             return;
         }
+        r.progress().settle(index);
 
-        long remaining = api.getActingCooldownRemaining(player.getUniqueId(), methodId);
-        summary.add(message(player, "magic.redeem.cooldown_credited",
+        long remaining = r.api().getActingCooldownRemaining(player.getUniqueId(), methodId);
+        r.summary().add(message(player, "magic.redeem.cooldown_credited",
                 "credited", formatDuration((int) credited),
                 "remaining", formatDuration((int) Math.max(0, remaining))));
     }
@@ -326,29 +511,33 @@ public class RewardRedeemer {
      * Both multiplier setters take a <b>duration</b>; Circle of Imagination adds "now" itself. Passing
      * an absolute timestamp here would set an expiry decades out and make the buff permanent.
      */
-    private void applySpeed(CircleOfImaginationAPI api, Player player, RewardGrant grant,
-                            List<Component> summary) {
-        if (api.getActingSpeedMultiplier(player) >= grant.amount()) {
+    private void applySpeed(Redemption r, int index, RewardGrant grant) {
+        Player player = r.player();
+        if (r.api().getActingSpeedMultiplier(player) >= grant.amount()) {
+            r.progress().settle(index);
             // They are already running a stronger buff; overwriting would be a downgrade.
-            summary.add(message(player, "magic.redeem.buff_kept"));
+            r.summary().add(message(player, "magic.redeem.buff_kept"));
             return;
         }
 
-        api.setActingSpeedMultiplier(player, grant.amount(), grant.intArg() * 1000L);
-        summary.add(message(player, "magic.redeem.speed_applied",
+        r.api().setActingSpeedMultiplier(player, grant.amount(), grant.intArg() * 1000L);
+        r.progress().settle(index);
+        r.summary().add(message(player, "magic.redeem.speed_applied",
                 "percent", Math.round(grant.amount() * 100),
                 "duration", formatDuration(grant.intArg())));
     }
 
-    private void applyItemMultiplier(CircleOfImaginationAPI api, Player player, RewardGrant grant,
-                                     List<Component> summary) {
-        if (api.getActingItemMultiplier(player) >= grant.amount()) {
-            summary.add(message(player, "magic.redeem.buff_kept"));
+    private void applyItemMultiplier(Redemption r, int index, RewardGrant grant) {
+        Player player = r.player();
+        if (r.api().getActingItemMultiplier(player) >= grant.amount()) {
+            r.progress().settle(index);
+            r.summary().add(message(player, "magic.redeem.buff_kept"));
             return;
         }
 
-        api.setActingItemMultiplier(player, grant.amount(), grant.intArg() * 1000L);
-        summary.add(message(player, "magic.redeem.item_mult_applied",
+        r.api().setActingItemMultiplier(player, grant.amount(), grant.intArg() * 1000L);
+        r.progress().settle(index);
+        r.summary().add(message(player, "magic.redeem.item_mult_applied",
                 "multiplier", multiplier(grant.amount()),
                 "duration", formatDuration(grant.intArg())));
     }
@@ -368,27 +557,28 @@ public class RewardRedeemer {
      * <p>Sized from the grant so a headline winner grant does not collapse into the same consolation
      * bottle as a minimal participation one.
      */
-    private void substitute(CircleOfImaginationAPI api, List<ItemStack> items,
-                            List<RewardGrant> itemGrants, RewardGrant grant) {
+    private void substitute(Redemption r, List<PendingItem> items, int index, RewardGrant grant) {
         double share = grant.kind() == RewardKind.ACTING_PERCENT || grant.kind() == RewardKind.COOLDOWN_CREDIT
                 ? Math.max(1.0, grant.amount())
                 : 1.0;
 
         int acting = (int) Math.round(config.fallbackBottleActing() * share / 2.0);
-        ItemStack bottle = api.createActingBottle(Math.max(1, acting));
+        ItemStack bottle = r.api().createActingBottle(Math.max(1, acting));
         if (bottle != null) {
-            items.add(bottle);
-            itemGrants.add(grant);
+            items.add(new PendingItem(bottle, grant, index));
+        } else {
+            unavailable(r, index);
         }
     }
 
-    private Optional<ItemStack> buildItem(CircleOfImaginationAPI api, Player player, int needed,
-                                          RewardGrant grant) {
+    private void buildItem(Redemption r, List<PendingItem> items, int index, RewardGrant grant) {
         RewardItemKind kind = grant.item();
         if (kind == null) {
-            return Optional.empty();
+            unavailable(r, index);
+            return;
         }
 
+        CircleOfImaginationAPI api = r.api();
         String tier = grant.strArg() == null ? "small" : grant.strArg();
         int sequence = tokenCeiling(grant);
 
@@ -396,7 +586,7 @@ public class RewardRedeemer {
             // The configured value is a percentage like every other amount in the file; resolve it
             // against the player's real bar here. Treating it as a raw point count would make one
             // bottle worth 10% of a Sequence-9 bar and 0.25% of a Sequence-3 one.
-            case ACTING_BOTTLE -> api.createActingBottle(bottleActing(needed, grant));
+            case ACTING_BOTTLE -> api.createActingBottle(bottleActing(r.needed(), grant));
             case SPIRITUALITY_POTION -> api.createSpiritualityPotion(tier, Math.max(1, grant.intArg()));
             case ACTING_MULTIPLIER -> api.createActingMultiplier(tier, grant.amount(), Math.max(1, grant.intArg()));
             case SPIRITUALITY_REGEN -> api.createSpiritualityRegenBooster(tier, grant.amount(), Math.max(1, grant.intArg()));
@@ -410,11 +600,24 @@ public class RewardRedeemer {
             case PATHWAY_TRANSFER_TOKEN -> api.createPathwayTransferToken();
         };
 
-        if (stack != null && grant.count() > 1) {
+        if (stack == null) {
+            unavailable(r, index);
+            return;
+        }
+
+        if (grant.count() > 1) {
             stack.setAmount(Math.min(stack.getMaxStackSize(), grant.count()));
         }
 
-        return Optional.ofNullable(stack);
+        items.add(new PendingItem(stack, grant, index));
+    }
+
+    /**
+     * Circle of Imagination could not build the item. Re-queuing would fail the same way on every
+     * login, so the grant is settled rather than carried into a retry.
+     */
+    private void unavailable(Redemption r, int index) {
+        r.progress().settle(index);
     }
 
     /**
@@ -428,72 +631,134 @@ public class RewardRedeemer {
         return Math.max(1, (int) Math.round(needed * grant.amount() / 100.0));
     }
 
-    private void giveItems(Player player, RewardBundle bundle, List<ItemStack> items,
-                           List<RewardGrant> itemGrants) {
+    /**
+     * Places the items, then drops or re-queues what did not fit, and only then talks to the player.
+     * Doing every state change before any message means a failure while formatting cannot leave an
+     * item half-handled.
+     */
+    private void giveItems(Redemption r, List<PendingItem> items) {
         if (items.isEmpty()) {
             return;
         }
 
+        Player player = r.player();
+
         // addItem consumes the array in place, so keep an untouched copy to reason about later.
         ItemStack[] offered = new ItemStack[items.size()];
         for (int i = 0; i < items.size(); i++) {
-            offered[i] = items.get(i).clone();
+            offered[i] = items.get(i).stack().clone();
         }
 
-        Map<Integer, ItemStack> leftovers = player.getInventory().addItem(offered);
+        // Settled before the hand-over, not after. addItem places stack by stack, so if it throws,
+        // any of them may already be in the inventory and there is no telling which. Re-queuing
+        // them would duplicate whatever landed; settling them loses whatever did not. Loss is the
+        // side taken, and the log line is what an operator reconciles from. Only leftovers that
+        // addItem reports after returning normally are re-opened below.
+        for (PendingItem item : items) {
+            r.progress().settle(item.index());
+        }
+
+        Map<Integer, ItemStack> leftovers;
+        try {
+            leftovers = player.getInventory().addItem(offered);
+        } catch (RuntimeException exception) {
+            plugin.log("Inventory hand-over for {} ({}) failed partway; {} item grant(s) treated as delivered, not retried",
+                    player.getName(), r.bundle().eventId(), items.size());
+            throw exception;
+        }
 
         List<RewardGrant> unplaced = new ArrayList<>();
         List<ItemStack> partial = new ArrayList<>();
+        List<Integer> partialIndexes = new ArrayList<>();
         // By index: RewardGrant is a record, so two identical grants are equal, and matching by
         // value could drop the same leftover stack twice.
         List<Integer> unplacedIndexes = new ArrayList<>();
+        List<Integer> placedIndexes = new ArrayList<>();
 
         for (int i = 0; i < items.size(); i++) {
+            PendingItem item = items.get(i);
             ItemStack rejected = leftovers.get(i);
-            if (rejected != null) {
-                if (rejected.getAmount() >= items.get(i).getAmount()) {
-                    unplaced.add(itemGrants.get(i));
-                    unplacedIndexes.add(i);
-                } else {
-                    // Part of the stack went in. Re-queuing the grant would hand over the whole
-                    // thing again, so the remainder goes on the floor instead.
-                    partial.add(rejected);
-                }
-                continue;
+            if (rejected == null) {
+                r.progress().settle(item.index());
+                placedIndexes.add(i);
+            } else if (rejected.getAmount() >= item.stack().getAmount()) {
+                // Nothing of it went in, so it is owed again until it is dropped or re-queued.
+                r.progress().reopen(item.index());
+                unplaced.add(item.grant());
+                unplacedIndexes.add(i);
+            } else {
+                // Part of the stack went in. Re-queuing the grant would hand over the whole
+                // thing again, so the remainder goes on the floor instead.
+                r.progress().partial(item.index(), withCount(item.grant(), rejected.getAmount()));
+                partial.add(rejected);
+                partialIndexes.add(i);
+            }
+        }
+
+        if (!leftovers.isEmpty()) {
+            Location location = player.getLocation();
+
+            // Whatever could only be partially placed is dropped regardless of the overflow policy.
+            for (int p = 0; p < partial.size(); p++) {
+                drop(r, items.get(partialIndexes.get(p)), partial.get(p), location);
             }
 
-            RewardGrant grant = itemGrants.get(i);
+            if (config.requeueOverflow() && !unplaced.isEmpty()) {
+                requeueOverflow(r, items, unplacedIndexes, unplaced);
+            } else if (!unplacedIndexes.isEmpty()) {
+                for (int index : unplacedIndexes) {
+                    drop(r, items.get(index), leftovers.get(index), location);
+                }
+            }
+        }
+
+        for (int i : placedIndexes) {
+            PendingItem item = items.get(i);
             player.sendMessage(message(player,
-                    grant.epic() ? "magic.redeem.item_given_epic" : "magic.redeem.item_given",
-                    "amount", items.get(i).getAmount(), "item", describeItem(items.get(i))));
+                    item.grant().epic() ? "magic.redeem.item_given_epic" : "magic.redeem.item_given",
+                    "amount", item.stack().getAmount(), "item", describeItem(item.stack())));
         }
 
         if (leftovers.isEmpty()) {
             return;
         }
 
-        // Whatever could only be partially placed is dropped regardless of the overflow policy.
-        partial.forEach(stack -> player.getWorld().dropItem(player.getLocation(), stack));
-
         if (config.requeueOverflow() && !unplaced.isEmpty()) {
-            // Re-queue under a distinct id so the claim guard does not reject the retry, and carry
-            // the grants across - an overflow bundle with no grants would silently destroy them.
-            RewardBundle overflow = new RewardBundle(
-                    RewardBundle.SCHEMA, bundle.eventId() + ":overflow", bundle.arena(),
-                    bundle.playerId(), bundle.playerName(), bundle.eventPathway(), bundle.won(),
-                    bundle.earnedAtEpochMs(), List.copyOf(unplaced));
-            plugin.offMainThread(() -> queue.returnToQueue(player.getUniqueId(), overflow));
             player.sendMessage(message(player, "magic.redeem.item_requeued", "count", unplaced.size()));
         } else if (!unplacedIndexes.isEmpty()) {
-            for (int index : unplacedIndexes) {
-                player.getWorld().dropItem(player.getLocation(), leftovers.get(index));
-            }
             player.sendMessage(message(player, "magic.redeem.item_dropped", "count", unplacedIndexes.size()));
         }
 
         if (!partial.isEmpty()) {
             player.sendMessage(message(player, "magic.redeem.item_dropped", "count", partial.size()));
         }
+    }
+
+    /**
+     * Re-queues under a distinct id so the claim guard does not reject the retry, and carries the
+     * grants across - an overflow bundle with no grants would silently destroy them.
+     */
+    private void requeueOverflow(Redemption r, List<PendingItem> items, List<Integer> unplacedIndexes,
+                                 List<RewardGrant> unplaced) {
+        RewardBundle bundle = r.bundle();
+        RewardBundle overflow = new RewardBundle(
+                RewardBundle.SCHEMA, bundle.eventId() + ":overflow", bundle.arena(),
+                bundle.playerId(), bundle.playerName(), bundle.eventPathway(), bundle.won(),
+                bundle.earnedAtEpochMs(), List.copyOf(unplaced));
+        for (int index : unplacedIndexes) {
+            r.progress().settle(items.get(index).index());
+        }
+        UUID playerId = r.player().getUniqueId();
+        plugin.offMainThread(() -> queue.returnToQueue(playerId, overflow));
+    }
+
+    /**
+     * Drops a stack at the player. The grant is settled once the drop has been made, so a later
+     * failure does not hand the same stack over again.
+     */
+    private void drop(Redemption r, PendingItem item, ItemStack stack, Location location) {
+        r.player().getWorld().dropItem(location, stack);
+        r.progress().settle(item.index());
     }
 
     private String describeItem(ItemStack stack) {
@@ -518,4 +783,73 @@ public class RewardRedeemer {
         return plugin.getLocaleManager().formatMessage(player, key, args);
     }
 
+    // ---- state --------------------------------------------------------------------------------
+
+    /**
+     * A popped bundle and the token its claim was tried with, so a retry after a lost reply
+     * recognises its own claim.
+     */
+    private record Unresolved(RewardBundle bundle, String token) {
+    }
+
+    /**
+     * Everything one bundle's apply needs, so the per-grant steps do not each take eight arguments.
+     */
+    private record Redemption(CircleOfImaginationAPI api, CoiCapabilities capabilities, Player player,
+                              String pathway, int needed, RewardBundle bundle, Progress progress,
+                              List<Component> summary) {
+    }
+
+    /**
+     * An item waiting to be handed over, remembering which grant it settles.
+     */
+    private record PendingItem(ItemStack stack, RewardGrant grant, int index) {
+    }
+
+    /**
+     * Which grants of one bundle have landed. A grant is settled the moment its effect is applied
+     * (or definitively cannot be), or just before an effect that could land without saying so, so
+     * the remainder after a failure never includes anything that may already have been given.
+     */
+    private static final class Progress {
+        final List<RewardGrant> ordered;
+        private final boolean[] settled;
+        private final RewardGrant[] partialRemainder;
+        boolean handedBack;
+
+        Progress(RewardBundle bundle) {
+            List<RewardGrant> sorted = new ArrayList<>(bundle.grants());
+            sorted.sort(APPLY_ORDER);
+            this.ordered = sorted;
+            this.settled = new boolean[sorted.size()];
+            this.partialRemainder = new RewardGrant[sorted.size()];
+        }
+
+        void settle(int index) {
+            settled[index] = true;
+            partialRemainder[index] = null;
+        }
+
+        /** Settled ahead of an effect that then turned out not to land; the whole grant is owed. */
+        void reopen(int index) {
+            settled[index] = false;
+            partialRemainder[index] = null;
+        }
+
+        /** Part of the grant landed; until the rest is handled, only {@code rest} is still owed. */
+        void partial(int index, RewardGrant rest) {
+            settled[index] = false;
+            partialRemainder[index] = rest;
+        }
+
+        List<RewardGrant> remainder() {
+            List<RewardGrant> rest = new ArrayList<>();
+            for (int i = 0; i < ordered.size(); i++) {
+                if (!settled[i]) {
+                    rest.add(partialRemainder[i] != null ? partialRemainder[i] : ordered.get(i));
+                }
+            }
+            return rest;
+        }
+    }
 }
