@@ -31,6 +31,10 @@ import java.util.*;
  * bundle re-queues exactly the grants that did not land, never the ones that did. The one effect
  * that can fail half-applied, the inventory hand-over, is settled before it runs instead: a grant
  * that may have landed is never re-queued, at the cost of losing it if it did not.
+ *
+ * <p>A bundle stays in Redis, parked under a lease no other server can take, from the moment it is
+ * popped until it has been applied. It is marked as being applied just before the first grant, and
+ * a mark left behind by a crash is reported to staff and never paid again.
  */
 public class RewardRedeemer {
 
@@ -51,26 +55,18 @@ public class RewardRedeemer {
     /** Appended, with a count, to the event id of a bundle handed back without being applied. */
     static final String RETURN_SUFFIX = ":return";
 
-    /** How long a held bundle waits before its claim is retried, while the player stays online. */
+    /** How long a drain that could not finish waits before trying again, while the player stays online. */
     private static final long RETRY_DELAY_TICKS = 20L * 30;
-
-    /** Bundles that may sit popped-but-unresolved at once, over all players. */
-    private static final int MAX_UNRESOLVED = 256;
 
     private final MythicBedwars plugin;
     private final RewardConfig config;
     private final RewardQueue queue;
 
     /**
-     * Bundles popped from Redis whose claim got no answer, one per player at most. Each is also
-     * parked in Redis, so a restart before the retry finds it there.
+     * Players with a drain under way here, from the lease to the last bundle settled. The lease in
+     * Redis keeps other servers out; this keeps a second drain here from taking the same bundle
+     * while the first is still applying it.
      */
-    private final Map<UUID, Unresolved> unresolved = new java.util.concurrent.ConcurrentHashMap<>();
-    /**
-     * One permit per bundle popped and not yet resolved, across all players. Held bundles keep
-     * theirs, so memory stays bounded even when their owners never come back before a restart.
-     */
-    private final java.util.concurrent.Semaphore admission = new java.util.concurrent.Semaphore(MAX_UNRESOLVED);
     private final Set<UUID> draining = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final Set<UUID> retryScheduled = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
@@ -153,105 +149,136 @@ public class RewardRedeemer {
     private void drain(Player player) {
         UUID playerId = player.getUniqueId();
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
-            // One drain per player at a time, so at most one unresolved bundle is ever held for them.
+            // One drain per player at a time, here and, by the lease, on every other server.
             if (!draining.add(playerId)) {
                 return;
             }
 
-            List<RewardBundle> claimed = new ArrayList<>();
+            String drain = UUID.randomUUID().toString();
+            boolean leased = false;
             try {
-                collect(playerId, claimed);
+                leased = queue.lease(playerId, drain);
             } finally {
-                draining.remove(playerId);
+                if (!leased) {
+                    draining.remove(playerId);
+                }
             }
-
-            if (unresolved.containsKey(playerId)) {
+            if (!leased) {
                 scheduleRetry(playerId);
-            }
-
-            if (claimed.isEmpty()) {
                 return;
             }
 
-            Bukkit.getScheduler().runTask(plugin, () -> applyClaimed(playerId, claimed));
+            advance(playerId, drain, 0);
         });
     }
 
     /**
-     * Claims what the player is owed, oldest first: the bundle held from an unanswered claim, then
-     * the queue. Stops at the first claim Redis does not answer, and polls nothing while one is held.
+     * Takes, applies and settles one bundle, then the next. Off the main thread; the apply hops onto
+     * it and the settling hops back, so one bundle is in flight per player and its record stays in
+     * Redis until it has been dealt with.
      */
-    private void collect(UUID playerId, List<RewardBundle> claimed) {
-        int polled = 0;
-        Unresolved held = unresolved.get(playerId);
-        if (held != null) {
-            // Already holds its admission permit, so resolving it never waits on capacity.
-            if (!resolve(playerId, held, claimed)) {
-                return;
-            }
-            unresolved.remove(playerId);
-            admission.release();
-            polled++;
-        }
-
-        for (; polled < config.maxBundlesPerJoin(); polled++) {
-            // At capacity nothing new is popped, so whatever is not admitted stays in Redis.
-            if (!admission.tryAcquire()) {
-                return;
-            }
-
-            boolean kept = false;
-            try {
-                RewardQueue.Parked parked = queue.park(playerId, UUID.randomUUID().toString()).orElse(null);
-                if (parked == null) {
-                    break;
-                }
-
-                Unresolved attempt = new Unresolved(parked.bundle(), parked.token());
-                if (!resolve(playerId, attempt, claimed)) {
-                    // Already popped, but parked in Redis too: a retry with the same token learns
-                    // whether the claim landed, even after a restart. It keeps the permit.
-                    unresolved.put(playerId, attempt);
-                    kept = true;
-                    return;
-                }
-            } finally {
-                if (!kept) {
-                    admission.release();
-                }
-            }
-        }
-    }
-
-    /**
-     * @return {@code false} if Redis did not answer, leaving the attempt open
-     */
-    private boolean resolve(UUID playerId, Unresolved attempt, List<RewardBundle> claimed) {
-        RewardQueue.ClaimAttempt result;
+    private void advance(UUID playerId, String drain, int done) {
+        RewardBundle bundle = null;
+        boolean retry = false;
         try {
-            result = queue.claimAttempt(playerId, attempt.bundle().eventId(), attempt.token());
-        } catch (RuntimeException unexpected) {
-            // Whether the claim landed is unknown, exactly as for a missing reply.
-            return false;
+            if (done < config.maxBundlesPerJoin()) {
+                Taken taken = take(playerId, drain);
+                bundle = taken.bundle();
+                retry = taken.retry();
+            }
+        } catch (RuntimeException exception) {
+            plugin.log("Failed to take rewards for {}: {}", playerId, String.valueOf(exception.getMessage()));
+            retry = true;
+        } finally {
+            if (bundle == null) {
+                queue.release(playerId, drain);
+                draining.remove(playerId);
+            }
         }
-        if (result == RewardQueue.ClaimAttempt.UNAVAILABLE) {
-            return false;
+
+        if (bundle == null) {
+            if (retry) {
+                scheduleRetry(playerId);
+            }
+            return;
         }
-        // Parked until now: only once it is dropped may the bundle count as claimed, or a failed
-        // drop would leave a claimed bundle to be claimed and applied again.
-        if (!queue.unpark(playerId)) {
-            return false;
-        }
-        // A DUPLICATE was already applied by somebody else; dropping it was the cleanup.
-        if (result == RewardQueue.ClaimAttempt.CLAIMED) {
-            claimed.add(attempt.bundle());
-        }
-        return true;
+
+        RewardBundle claimed = bundle;
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            List<RewardBundle> giveBack = List.of();
+            try {
+                giveBack = applyClaimed(playerId, claimed);
+            } finally {
+                List<RewardBundle> back = giveBack;
+                plugin.offMainThread(() -> settle(playerId, drain, claimed, back, done));
+            }
+        });
     }
 
     /**
-     * Tries a held bundle again later while the player stays online. Offline players are left to
-     * their next join, which resolves the held bundle before polling anything new.
+     * Drops the applied bundle from Redis and carries on while the player is still owed more. Stops
+     * when something was handed back: it would only be taken again.
+     */
+    private void settle(UUID playerId, String drain, RewardBundle bundle, List<RewardBundle> giveBack, int done) {
+        boolean more = giveBack.isEmpty();
+        try {
+            if (!queue.unpark(playerId, drain, giveBack)) {
+                more = false;
+                plugin.log("Could not settle reward bundle {} for {}; it stays parked and is reported at the next start.",
+                        bundle.eventId(), bundle.playerName());
+            }
+        } catch (RuntimeException exception) {
+            more = false;
+        }
+
+        if (more && Bukkit.getPlayer(playerId) != null) {
+            advance(playerId, drain, done + 1);
+            return;
+        }
+        queue.release(playerId, drain);
+        draining.remove(playerId);
+    }
+
+    /**
+     * Takes the next bundle: claims it and marks it as being applied, both durably, before anything
+     * is given. A bundle whose claim Redis does not answer stays parked, and a retry with its stored
+     * token learns whether the claim landed, even after a restart.
+     */
+    private Taken take(UUID playerId, String drain) {
+        while (true) {
+            RewardQueue.Parked parked = queue.park(playerId, drain, UUID.randomUUID().toString());
+            if (parked.status() == RewardQueue.ParkStatus.EMPTY) {
+                return new Taken(null, false);
+            }
+            if (parked.status() == RewardQueue.ParkStatus.UNAVAILABLE) {
+                return new Taken(null, true);
+            }
+
+            RewardQueue.ClaimAttempt result = queue.claimAttempt(
+                    playerId, drain, parked.bundle().eventId(), parked.token());
+            if (result == RewardQueue.ClaimAttempt.UNAVAILABLE) {
+                return new Taken(null, true);
+            }
+
+            if (result == RewardQueue.ClaimAttempt.DUPLICATE) {
+                // Already applied by somebody else; dropping it was the cleanup.
+                if (!queue.unpark(playerId, drain, List.of())) {
+                    return new Taken(null, true);
+                }
+                continue;
+            }
+
+            // Not applied yet, so nothing can be missing: only now does a restart stop being safe.
+            if (!queue.markApplying(playerId, drain, parked.token())) {
+                return new Taken(null, true);
+            }
+            return new Taken(parked.bundle(), false);
+        }
+    }
+
+    /**
+     * Tries again later while the player stays online. Offline players are left to their next join,
+     * which finds whatever is still parked.
      */
     private void scheduleRetry(UUID playerId) {
         if (!plugin.isEnabled() || !retryScheduled.add(playerId)) {
@@ -261,7 +288,7 @@ public class RewardRedeemer {
             Bukkit.getScheduler().runTaskLater(plugin, () -> {
                 retryScheduled.remove(playerId);
                 Player online = Bukkit.getPlayer(playerId);
-                if (online != null && unresolved.containsKey(playerId)) {
+                if (online != null) {
                     drain(online);
                 }
             }, RETRY_DELAY_TICKS);
@@ -270,7 +297,10 @@ public class RewardRedeemer {
         }
     }
 
-    private void applyClaimed(UUID playerId, List<RewardBundle> claimed) {
+    /**
+     * @return what has to go back to the queue
+     */
+    private List<RewardBundle> applyClaimed(UUID playerId, RewardBundle bundle) {
         // Collected rather than pushed inline: returning a bundle is a Redis round trip, and this
         // block runs on the main thread.
         List<RewardBundle> giveBack = new ArrayList<>();
@@ -280,26 +310,21 @@ public class RewardRedeemer {
         // and items handed to its inventory would vanish with it.
         Player player = Bukkit.getPlayer(playerId);
         if (player == null) {
-            // Put them back untouched rather than losing them to a badly timed logout.
-            claimed.forEach(bundle -> giveBack.add(returned(bundle)));
+            // Put it back untouched rather than losing it to a badly timed logout.
+            giveBack.add(returned(bundle));
         } else {
-            for (RewardBundle bundle : claimed) {
-                Progress progress = new Progress(bundle);
-                try {
-                    apply(player, bundle, progress, giveBack);
-                } catch (RuntimeException exception) {
-                    // Everything in `claimed` is already popped and claimed, so letting this
-                    // propagate would destroy the bundles after it as well as this one.
-                    plugin.log("Failed to apply rewards for {} ({}): {}",
-                            player.getName(), bundle.eventId(), String.valueOf(exception.getMessage()));
-                    handleFailure(bundle, progress, giveBack);
-                }
+            Progress progress = new Progress(bundle);
+            try {
+                apply(player, bundle, progress, giveBack);
+            } catch (RuntimeException exception) {
+                // The bundle is already claimed, so the grants that did not land have to be put back.
+                plugin.log("Failed to apply rewards for {} ({}): {}",
+                        player.getName(), bundle.eventId(), String.valueOf(exception.getMessage()));
+                handleFailure(bundle, progress, giveBack);
             }
         }
 
-        if (!giveBack.isEmpty()) {
-            requeue(playerId, giveBack);
-        }
+        return giveBack;
     }
 
     /**
@@ -351,19 +376,6 @@ public class RewardRedeemer {
         return eventId + RETURN_SUFFIX + 1;
     }
 
-    /**
-     * Pushes bundles back, oldest last, so the queue order survives. Each push goes to the head of
-     * the list, hence the reversal. Every bundle here travels under an id of its own, so no claim
-     * needs releasing.
-     */
-    private void requeue(UUID playerId, List<RewardBundle> bundles) {
-        plugin.offMainThread(() -> {
-            for (RewardBundle bundle : bundles.reversed()) {
-                queue.returnToQueue(playerId, bundle);
-            }
-        });
-    }
-
     private void apply(Player player, RewardBundle bundle, Progress progress, List<RewardBundle> giveBack) {
         CircleOfImaginationAPI api = plugin.getCircleOfImaginationAPI();
         CoiCapabilities capabilities = plugin.getCoiCapabilities();
@@ -382,7 +394,7 @@ public class RewardRedeemer {
 
         int needed = beyonder ? api.getActingRequiredForNextSequence(player, pathway) : 0;
         Redemption r = new Redemption(api, capabilities, player, pathway, needed, bundle, progress,
-                new ArrayList<>());
+                new ArrayList<>(), giveBack);
 
         List<PendingItem> items = new ArrayList<>();
         List<RewardGrant> ordered = progress.ordered;
@@ -751,8 +763,8 @@ public class RewardRedeemer {
         for (int index : unplacedIndexes) {
             r.progress().settle(items.get(index).index());
         }
-        UUID playerId = r.player().getUniqueId();
-        plugin.offMainThread(() -> queue.returnToQueue(playerId, overflow));
+        // Goes back with the rest, in the same step that drops the parked bundle.
+        r.giveBack().add(overflow);
     }
 
     /**
@@ -789,10 +801,10 @@ public class RewardRedeemer {
     // ---- state --------------------------------------------------------------------------------
 
     /**
-     * A popped bundle and the token its claim was tried with, so a retry after a lost reply
-     * recognises its own claim.
+     * What taking the next bundle came to: the bundle to apply, or none, with whether to try again
+     * later.
      */
-    private record Unresolved(RewardBundle bundle, String token) {
+    private record Taken(RewardBundle bundle, boolean retry) {
     }
 
     /**
@@ -800,7 +812,7 @@ public class RewardRedeemer {
      */
     private record Redemption(CircleOfImaginationAPI api, CoiCapabilities capabilities, Player player,
                               String pathway, int needed, RewardBundle bundle, Progress progress,
-                              List<Component> summary) {
+                              List<Component> summary, List<RewardBundle> giveBack) {
     }
 
     /**

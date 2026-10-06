@@ -7,8 +7,9 @@ import dev.ua.ikeepcalm.bedwars.domain.reward.model.RewardModel.RewardBundle;
 import dev.ua.ikeepcalm.bedwars.net.transport.RedisClient;
 import dev.ua.ikeepcalm.bedwars.net.transport.RedisKeys;
 
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -39,11 +40,13 @@ public class RewardQueue {
             """;
 
     /**
-     * Claims with an owner token. {@code KEYS[1]} claim marker, {@code ARGV[1]} token,
-     * {@code ARGV[2]} ttl. Returns 1 when claimed now or by an earlier try with the same token,
-     * 0 when anyone else holds it (including markers written by {@link #claim}).
+     * Claims with an owner token, for the drain that holds the lease. {@code KEYS[1]} claim marker,
+     * {@code KEYS[2]} drain lease, {@code ARGV[1]} token, {@code ARGV[2]} ttl, {@code ARGV[3]} drain.
+     * Returns 1 when claimed now or by an earlier try with the same token, 0 when anyone else holds
+     * it (including markers written by {@link #claim}), -2 when the lease is not this drain's.
      */
     private static final String CLAIM = """
+            if redis.call('GET', KEYS[2]) ~= ARGV[3] then return -2 end
             local held = redis.call('GET', KEYS[1])
             if held == ARGV[1] then return 1 end
             if held then return 0 end
@@ -52,23 +55,70 @@ public class RewardQueue {
             """;
 
     /**
-     * Pops the next bundle and parks it, with its claim token, in one step: until the claim is known
-     * the bundle is in Redis, not only in memory. {@code KEYS[1]} pending list, {@code KEYS[2]} parked
-     * key, {@code ARGV[1]} token, {@code ARGV[2]} ttl.
+     * Pops the next bundle and parks it, with its claim token, in one step: from then until it is
+     * applied the bundle is in Redis, not only in memory. Only the drain holding the lease may park,
+     * and the lease is extended. {@code KEYS[1]} pending list, {@code KEYS[2]} parked hash,
+     * {@code KEYS[3]} drain lease, {@code ARGV[1]} drain, {@code ARGV[2]} token, {@code ARGV[3]} ttl,
+     * {@code ARGV[4]} lease ttl.
      *
-     * <p>Returns 2 when a bundle was already parked (left alone), 1 when one was parked now,
-     * 0 when nothing is pending.
+     * <p>Returns 3 when the parked bundle was being applied when its drain died (left alone), 2 when
+     * a bundle was already parked (left alone), 1 when one was parked now, 0 when nothing is
+     * pending, -2 when the lease is not this drain's.
      */
     private static final String PARK = """
-            if redis.call('EXISTS', KEYS[2]) == 1 then return 2 end
+            if redis.call('GET', KEYS[3]) ~= ARGV[1] then return -2 end
+            redis.call('EXPIRE', KEYS[3], tonumber(ARGV[4]))
+            local state = redis.call('HGET', KEYS[2], 'state')
+            if state == 'applying' then return 3 end
+            if state then return 2 end
             local raw = redis.call('LPOP', KEYS[1])
             if not raw then return 0 end
-            redis.call('SET', KEYS[2], ARGV[1] .. '\n' .. raw, 'EX', tonumber(ARGV[2]))
+            redis.call('HSET', KEYS[2], 'state', 'parked', 'token', ARGV[2], 'bundle', raw)
+            redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
             return 1
             """;
 
-    /** A popped bundle and the token its claim is tried with. */
-    record Parked(RewardBundle bundle, String token) {
+    /**
+     * Marks the parked bundle as being applied, for good: the grants are not idempotent, so from here
+     * a restart must not apply it again, only report it. {@code KEYS[1]} parked hash, {@code KEYS[2]}
+     * drain lease, {@code ARGV[1]} drain, {@code ARGV[2]} token. Returns 1 when marked, -2 when the
+     * lease or the parked bundle is not this drain's.
+     */
+    private static final String APPLYING = """
+            if redis.call('GET', KEYS[2]) ~= ARGV[1] then return -2 end
+            if redis.call('HGET', KEYS[1], 'token') ~= ARGV[2] then return -2 end
+            redis.call('HSET', KEYS[1], 'state', 'applying')
+            redis.call('PERSIST', KEYS[1])
+            return 1
+            """;
+
+    /**
+     * Drops the parked bundle and puts back what was handed back, in one step, so a crash cannot
+     * leave both or neither. {@code KEYS[1]} parked hash, {@code KEYS[2]} drain lease,
+     * {@code KEYS[3]} pending list, {@code ARGV[1]} drain, {@code ARGV[2]} ttl, the rest payloads
+     * pushed to the front in the order given. Returns -2 when the lease is not this drain's.
+     */
+    private static final String UNPARK = """
+            if redis.call('GET', KEYS[2]) ~= ARGV[1] then return -2 end
+            for i = 3, #ARGV do redis.call('LPUSH', KEYS[3], ARGV[i]) end
+            if #ARGV > 2 then redis.call('EXPIRE', KEYS[3], tonumber(ARGV[2])) end
+            return redis.call('DEL', KEYS[1])
+            """;
+
+    /** How long a drain holds a player; extended each time it parks. */
+    private static final int LEASE_SECONDS = 120;
+
+    /** What {@link #park} found. */
+    enum ParkStatus {
+        PARKED,
+        /** Nothing is pending. */
+        EMPTY,
+        /** No answer from Redis, or another drain holds the player; try again later. */
+        UNAVAILABLE
+    }
+
+    /** The outcome of a {@link #park}, with the bundle and the token its claim is tried with. */
+    record Parked(ParkStatus status, RewardBundle bundle, String token) {
     }
 
     /** What a {@link #claimAttempt} learned. */
@@ -118,52 +168,123 @@ public class RewardQueue {
     }
 
     /**
+     * Takes the lease on a player's rewards, so one drain at a time works on them across every server.
+     * It lapses on its own if the holder dies. Does Redis I/O.
+     *
+     * @param drain who is taking it; every later call for this drain passes the same value
+     * @return {@code false} if another drain holds it, or Redis did not answer
+     */
+    boolean lease(UUID playerId, String drain) {
+        return client.setIfAbsent(keys.rewardsDrain(playerId), drain, LEASE_SECONDS);
+    }
+
+    /** Gives the lease up, if it is still this drain's. */
+    void release(UUID playerId, String drain) {
+        client.deleteIfEquals(keys.rewardsDrain(playerId), drain);
+    }
+
+    /**
      * Takes the next bundle for a player, if any, parking it in Redis until {@link #unpark}. A bundle
      * already parked, such as one left by a restart, comes back first with the token it was claimed
-     * with. Does Redis I/O.
+     * with. One that was being applied when its drain died is moved to the dead letters and reported,
+     * never handed out again. Does Redis I/O.
      *
+     * @param drain the drain holding the lease
      * @param token the claim token for a bundle parked now
      */
-    public Optional<Parked> park(UUID playerId, String token) {
+    Parked park(UUID playerId, String drain, String token) {
         String parkedKey = keys.rewardsParked(playerId);
-        long result = client.evalLong(PARK, List.of(keys.rewardsPending(playerId), parkedKey),
-                List.of(token, Integer.toString(config.queueTtlSeconds())), -1L);
-        if (result <= 0) {
-            return Optional.empty();
+        long result = client.evalLong(PARK,
+                List.of(keys.rewardsPending(playerId), parkedKey, keys.rewardsDrain(playerId)),
+                List.of(drain, token, Integer.toString(config.queueTtlSeconds()), Integer.toString(LEASE_SECONDS)),
+                -1L);
+        if (result < 0) {
+            return new Parked(ParkStatus.UNAVAILABLE, null, null);
+        }
+        if (result == 0) {
+            return new Parked(ParkStatus.EMPTY, null, null);
         }
 
         // A reply lost after a park is found by the next call, which answers 2.
-        Optional<String> stored = client.get(parkedKey);
-        if (stored.isEmpty()) {
-            return Optional.empty();
+        Map<String, String> stored = client.hgetAll(parkedKey);
+        String raw = stored.get("bundle");
+        if (raw == null) {
+            return new Parked(ParkStatus.EMPTY, null, null);
         }
 
-        String value = stored.get();
-        int split = value.indexOf('\n');
-        String raw = split < 0 ? value : value.substring(split + 1);
+        RewardBundle bundle = read(raw);
+        if (result == 3) {
+            plugin.getLogger().warning("Reward bundle " + (bundle == null ? "?" : bundle.eventId()) + " for "
+                    + (bundle == null ? playerId : bundle.playerName()) + " was being applied when the server "
+                    + "stopped, so it may be partly or not at all delivered. It will NOT be paid again; it was "
+                    + "moved to the dead letters (" + keys.rewardsDeadLetter() + ") for staff to check.");
+            quarantine(raw, "stuck while applying");
+            return unpark(playerId, drain, List.of())
+                    ? new Parked(ParkStatus.EMPTY, null, null)
+                    : new Parked(ParkStatus.UNAVAILABLE, null, null);
+        }
+        if (bundle == null) {
+            quarantine(raw, "unsupported schema or unreadable");
+            return unpark(playerId, drain, List.of())
+                    ? new Parked(ParkStatus.EMPTY, null, null)
+                    : new Parked(ParkStatus.UNAVAILABLE, null, null);
+        }
+        return new Parked(ParkStatus.PARKED, bundle, stored.get("token"));
+    }
+
+    private RewardBundle read(String raw) {
         try {
-            RewardBundle bundle = split < 0 ? null : gson.fromJson(raw, RewardBundle.class);
-            if (bundle == null || bundle.schema() != RewardBundle.SCHEMA) {
-                quarantine(raw, "unsupported schema");
-                unpark(playerId);
-                return Optional.empty();
-            }
-            return Optional.of(new Parked(bundle, value.substring(0, split)));
+            RewardBundle bundle = gson.fromJson(raw, RewardBundle.class);
+            return bundle == null || bundle.schema() != RewardBundle.SCHEMA ? null : bundle;
         } catch (JsonSyntaxException exception) {
-            quarantine(raw, exception.getMessage());
-            unpark(playerId);
-            return Optional.empty();
+            return null;
         }
     }
 
     /**
-     * Drops the parked bundle once its claim is known.
+     * Marks the parked bundle as being applied, durably, before anything is given.
      *
-     * @return {@code false} if Redis did not answer, leaving it parked
+     * @return {@code false} if it could not be marked, in which case nothing may be applied
      */
-    boolean unpark(UUID playerId) {
-        return client.evalLong("return redis.call('DEL', KEYS[1])", List.of(keys.rewardsParked(playerId)),
-                List.of(), -1L) >= 0;
+    boolean markApplying(UUID playerId, String drain, String token) {
+        return client.evalLong(APPLYING, List.of(keys.rewardsParked(playerId), keys.rewardsDrain(playerId)),
+                List.of(drain, token), -1L) == 1L;
+    }
+
+    /**
+     * Drops the parked bundle once it is dealt with, and puts back what was handed back, in the same
+     * step.
+     *
+     * @param giveBack bundles to return to the front of the queue, in queue order
+     * @return {@code false} if Redis did not answer or the lease was lost, leaving it parked
+     */
+    boolean unpark(UUID playerId, String drain, List<RewardBundle> giveBack) {
+        List<String> args = new ArrayList<>(List.of(drain, Integer.toString(config.queueTtlSeconds())));
+        // Each push goes to the head of the list, hence the reversal.
+        for (RewardBundle bundle : giveBack.reversed()) {
+            args.add(gson.toJson(bundle));
+        }
+        return client.evalLong(UNPARK,
+                List.of(keys.rewardsParked(playerId), keys.rewardsDrain(playerId), keys.rewardsPending(playerId)),
+                args, -1L) >= 0;
+    }
+
+    /**
+     * Reports bundles left being applied by a server that stopped, so staff hear about them even if
+     * the player never comes back. Does Redis I/O; call once at startup.
+     */
+    public void reportStuck() {
+        for (String key : client.scan(keys.rewardsParkedPattern(), 1000)) {
+            Map<String, String> stored = client.hgetAll(key);
+            if (!"applying".equals(stored.get("state"))) {
+                continue;
+            }
+            RewardBundle bundle = read(String.valueOf(stored.get("bundle")));
+            plugin.getLogger().warning("Reward bundle " + (bundle == null ? "?" : bundle.eventId()) + " for "
+                    + (bundle == null ? key : bundle.playerName()) + " was being applied when the server "
+                    + "stopped, so it may be partly or not at all delivered. It will NOT be paid again. "
+                    + "Staff: check the player, then delete " + key + ".");
+        }
     }
 
     /**
@@ -185,11 +306,13 @@ public class RewardQueue {
 
     /**
      * Like {@link #claim}, but an outage is not mistaken for a duplicate. Retrying with the same
-     * {@code token} after a lost reply finds its own marker and still counts as claimed. Does Redis I/O.
+     * {@code token} after a lost reply finds its own marker and still counts as claimed. Only the
+     * drain holding the lease can claim. Does Redis I/O.
      */
-    ClaimAttempt claimAttempt(UUID playerId, String eventId, String token) {
-        long result = client.evalLong(CLAIM, List.of(keys.rewardsClaimed(playerId, eventId)),
-                List.of(token, Integer.toString(config.queueTtlSeconds())), -1L);
+    ClaimAttempt claimAttempt(UUID playerId, String drain, String eventId, String token) {
+        long result = client.evalLong(CLAIM,
+                List.of(keys.rewardsClaimed(playerId, eventId), keys.rewardsDrain(playerId)),
+                List.of(token, Integer.toString(config.queueTtlSeconds()), drain), -1L);
         if (result == 1L) {
             return ClaimAttempt.CLAIMED;
         }

@@ -535,6 +535,7 @@ public final class MythicBedwars extends JavaPlugin {
             eventOrchestrator.recoverOnBoot();
         } else if (recruitmentManager != null) {
             recruitmentManager.recoverOnBoot();
+            offMainThread(rewardQueue::reportStuck);
         }
 
         this.eventStore = store;
