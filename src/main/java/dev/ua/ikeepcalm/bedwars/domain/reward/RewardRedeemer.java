@@ -70,6 +70,11 @@ public class RewardRedeemer {
     private final Set<UUID> draining = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final Set<UUID> retryScheduled = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /** Renews the lease of each drain under way, so a slow main-thread apply cannot outlive it. */
+    private final Map<UUID, org.bukkit.scheduler.BukkitTask> heartbeats = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static final long HEARTBEAT_TICKS = 20L * 30;
+
     public RewardRedeemer(MythicBedwars plugin, RewardConfig config, RewardQueue queue) {
         this.plugin = plugin;
         this.config = config;
@@ -168,8 +173,37 @@ public class RewardRedeemer {
                 return;
             }
 
+            startHeartbeat(playerId, drain);
             advance(playerId, drain, 0);
         });
+    }
+
+    /** Renews the lease every ~30s, off the main thread, until {@link #finish}. */
+    private void startHeartbeat(UUID playerId, String drain) {
+        try {
+            heartbeats.put(playerId, Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, () -> {
+                try {
+                    if (!queue.renew(playerId, drain)) {
+                        plugin.log("Lost the reward lease for {} while it was held.", playerId);
+                    }
+                } catch (RuntimeException exception) {
+                    plugin.log("Could not renew the reward lease for {}: {}", playerId,
+                            String.valueOf(exception.getMessage()));
+                }
+            }, HEARTBEAT_TICKS, HEARTBEAT_TICKS));
+        } catch (IllegalPluginAccessException disabled) {
+            // Shutting down: the lease lapses on its own.
+        }
+    }
+
+    /** Ends a drain: stops its heartbeat and gives the lease up. */
+    private void finish(UUID playerId, String drain) {
+        org.bukkit.scheduler.BukkitTask heartbeat = heartbeats.remove(playerId);
+        if (heartbeat != null) {
+            heartbeat.cancel();
+        }
+        queue.release(playerId, drain);
+        draining.remove(playerId);
     }
 
     /**
@@ -191,8 +225,7 @@ public class RewardRedeemer {
             retry = true;
         } finally {
             if (bundle == null) {
-                queue.release(playerId, drain);
-                draining.remove(playerId);
+                finish(playerId, drain);
             }
         }
 
@@ -235,8 +268,7 @@ public class RewardRedeemer {
             advance(playerId, drain, done + 1);
             return;
         }
-        queue.release(playerId, drain);
-        draining.remove(playerId);
+        finish(playerId, drain);
     }
 
     /**

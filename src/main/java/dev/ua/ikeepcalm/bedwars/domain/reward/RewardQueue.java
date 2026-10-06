@@ -59,17 +59,23 @@ public class RewardQueue {
      * applied the bundle is in Redis, not only in memory. Only the drain holding the lease may park,
      * and the lease is extended. {@code KEYS[1]} pending list, {@code KEYS[2]} parked hash,
      * {@code KEYS[3]} drain lease, {@code ARGV[1]} drain, {@code ARGV[2]} token, {@code ARGV[3]} ttl,
-     * {@code ARGV[4]} lease ttl.
+     * {@code ARGV[4]} lease ttl, {@code ARGV[5]} now (ms), {@code ARGV[6]} grace (ms).
      *
-     * <p>Returns 3 when the parked bundle was being applied when its drain died (left alone), 2 when
-     * a bundle was already parked (left alone), 1 when one was parked now, 0 when nothing is
-     * pending, -2 when the lease is not this drain's.
+     * <p>Returns 4 when the parked bundle is being applied and its owner beat within the grace
+     * period (left alone, may still be alive), 3 when it is being applied and the beat is older than
+     * the grace period, so its drain died (left alone), 2 when a bundle was already parked (left
+     * alone), 1 when one was parked now, 0 when nothing is pending, -2 when the lease is not this
+     * drain's.
      */
     private static final String PARK = """
             if redis.call('GET', KEYS[3]) ~= ARGV[1] then return -2 end
             redis.call('EXPIRE', KEYS[3], tonumber(ARGV[4]))
             local state = redis.call('HGET', KEYS[2], 'state')
-            if state == 'applying' then return 3 end
+            if state == 'applying' then
+              local beat = tonumber(redis.call('HGET', KEYS[2], 'beat') or '0') or 0
+              if tonumber(ARGV[5]) - beat > tonumber(ARGV[6]) then return 3 end
+              return 4
+            end
             if state then return 2 end
             local raw = redis.call('LPOP', KEYS[1])
             if not raw then return 0 end
@@ -81,13 +87,13 @@ public class RewardQueue {
     /**
      * Marks the parked bundle as being applied, for good: the grants are not idempotent, so from here
      * a restart must not apply it again, only report it. {@code KEYS[1]} parked hash, {@code KEYS[2]}
-     * drain lease, {@code ARGV[1]} drain, {@code ARGV[2]} token. Returns 1 when marked, -2 when the
-     * lease or the parked bundle is not this drain's.
+     * drain lease, {@code ARGV[1]} drain, {@code ARGV[2]} token, {@code ARGV[3]} now (ms), the first
+     * heartbeat. Returns 1 when marked, -2 when the lease or the parked bundle is not this drain's.
      */
     private static final String APPLYING = """
             if redis.call('GET', KEYS[2]) ~= ARGV[1] then return -2 end
             if redis.call('HGET', KEYS[1], 'token') ~= ARGV[2] then return -2 end
-            redis.call('HSET', KEYS[1], 'state', 'applying')
+            redis.call('HSET', KEYS[1], 'state', 'applying', 'beat', ARGV[3])
             redis.call('PERSIST', KEYS[1])
             return 1
             """;
@@ -105,8 +111,27 @@ public class RewardQueue {
             return redis.call('DEL', KEYS[1])
             """;
 
-    /** How long a drain holds a player; extended each time it parks. */
+    /**
+     * Renews the lease and stamps the parked record with a heartbeat, for a drain that is still
+     * alive. {@code KEYS[1]} parked hash, {@code KEYS[2]} drain lease, {@code ARGV[1]} drain,
+     * {@code ARGV[2]} lease ttl, {@code ARGV[3]} now (ms). Returns 1 when renewed, -2 when the lease
+     * is not this drain's.
+     */
+    private static final String RENEW = """
+            if redis.call('GET', KEYS[2]) ~= ARGV[1] then return -2 end
+            redis.call('EXPIRE', KEYS[2], tonumber(ARGV[2]))
+            if redis.call('EXISTS', KEYS[1]) == 1 then redis.call('HSET', KEYS[1], 'beat', ARGV[3]) end
+            return 1
+            """;
+
+    /** How long a drain holds a player; extended each time it parks and by the heartbeat. */
     private static final int LEASE_SECONDS = 120;
+
+    /**
+     * How long an {@code applying} record may go without a heartbeat before another server treats
+     * its drain as dead. The lease lapsing alone is not enough: the heartbeat can stall briefly.
+     */
+    private static final long APPLYING_GRACE_MILLIS = 5L * 60 * 1000;
 
     /** What {@link #park} found. */
     enum ParkStatus {
@@ -178,6 +203,17 @@ public class RewardQueue {
         return client.setIfAbsent(keys.rewardsDrain(playerId), drain, LEASE_SECONDS);
     }
 
+    /**
+     * Keeps the lease and the parked record alive while this drain still works on the player. Does
+     * Redis I/O.
+     *
+     * @return {@code false} if the lease is no longer this drain's or Redis did not answer
+     */
+    boolean renew(UUID playerId, String drain) {
+        return client.evalLong(RENEW, List.of(keys.rewardsParked(playerId), keys.rewardsDrain(playerId)),
+                List.of(drain, Integer.toString(LEASE_SECONDS), Long.toString(System.currentTimeMillis())), -1L) == 1L;
+    }
+
     /** Gives the lease up, if it is still this drain's. */
     void release(UUID playerId, String drain) {
         client.deleteIfEquals(keys.rewardsDrain(playerId), drain);
@@ -196,9 +232,11 @@ public class RewardQueue {
         String parkedKey = keys.rewardsParked(playerId);
         long result = client.evalLong(PARK,
                 List.of(keys.rewardsPending(playerId), parkedKey, keys.rewardsDrain(playerId)),
-                List.of(drain, token, Integer.toString(config.queueTtlSeconds()), Integer.toString(LEASE_SECONDS)),
+                List.of(drain, token, Integer.toString(config.queueTtlSeconds()), Integer.toString(LEASE_SECONDS),
+                        Long.toString(System.currentTimeMillis()), Long.toString(APPLYING_GRACE_MILLIS)),
                 -1L);
-        if (result < 0) {
+        if (result < 0 || result == 4) {
+            // 4: being applied and heard from recently, so its drain may still be alive; wait.
             return new Parked(ParkStatus.UNAVAILABLE, null, null);
         }
         if (result == 0) {
@@ -248,7 +286,7 @@ public class RewardQueue {
      */
     boolean markApplying(UUID playerId, String drain, String token) {
         return client.evalLong(APPLYING, List.of(keys.rewardsParked(playerId), keys.rewardsDrain(playerId)),
-                List.of(drain, token), -1L) == 1L;
+                List.of(drain, token, Long.toString(System.currentTimeMillis())), -1L) == 1L;
     }
 
     /**
