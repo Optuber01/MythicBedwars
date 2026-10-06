@@ -3,17 +3,22 @@ package dev.ua.ikeepcalm.bedwars.cmd;
 import dev.ua.ikeepcalm.bedwars.MythicBedwars;
 import dev.ua.ikeepcalm.bedwars.cmd.impls.EventCommand;
 import dev.ua.ikeepcalm.bedwars.cmd.impls.MinigameSubcommands;
+import dev.ua.ikeepcalm.bedwars.domain.reward.RewardConfig;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditRisk;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
+import org.bukkit.entity.Entity;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 
 /**
  * Router for {@code /mythicbedwars}.
@@ -107,24 +112,63 @@ public class CommandManager implements CommandExecutor, TabCompleter {
 
     private void handleToggle(CommandSender sender) {
         boolean newState = plugin.getConfigManager().toggleGlobalEnabled();
+        plugin.getAudit().emitAdmin(sender, "toggle", AuditOutcome.COMMITTED, null,
+                row -> row.put("global_enabled", newState).put("role", plugin.getNetworkRole().name()));
         sender.sendMessage(plugin.getLocaleManager().formatMessage(
                 newState ? "magic.commands.global_enabled" : "magic.commands.global_disabled"));
     }
 
     private void handleReload(CommandSender sender) {
-        plugin.getConfigManager().loadConfig();
-        plugin.getLocaleManager().loadLocales();
+        String rewardsBefore = plugin.getRewardConfig() == null ? null : plugin.getRewardConfig().contentHash();
+        String configBefore = plugin.getConfigHash();
+        String stage = "config";
+        List<String> rearmed;
+        try {
+            plugin.getConfigManager().loadConfig();
+            stage = "locales";
+            plugin.getLocaleManager().loadLocales();
 
-        // Reward tuning is the thing an operator is most likely to be iterating on, and load() is
-        // idempotent — reporting "reloaded" while still paying out the old loot table is worse than
-        // not offering a reload at all.
-        if (plugin.getRewardConfig() != null) {
-            plugin.getRewardConfig().load();
+            // Reward tuning is the thing an operator is most likely to be iterating on, and load() is
+            // idempotent — reporting "reloaded" while still paying out the old loot table is worse than
+            // not offering a reload at all.
+            stage = "rewards";
+            if (plugin.getRewardConfig() != null) {
+                plugin.getRewardConfig().load();
+            }
+
+            // A repeating task's period is fixed when it is scheduled, so re-reading the config is not
+            // enough on its own — anything driven by an interval has to be replaced.
+            stage = "tasks";
+            rearmed = plugin.reloadScheduledTasks();
+        } catch (RuntimeException | LinkageError failure) {
+            // Earlier stages have already been applied, so say which one stopped.
+            String failedStage = stage;
+            plugin.getAudit().emitAdmin(sender, "reload", AuditOutcome.FAILED, "reload_failed",
+                    row -> row.risk(AuditRisk.HIGH).put("role", plugin.getNetworkRole().name())
+                            .put("stage", failedStage)
+                            .put("error", failure.getClass().getSimpleName() + ": " + failure.getMessage()));
+            throw failure;
         }
-
-        // A repeating task's period is fixed when it is scheduled, so re-reading the config is not
-        // enough on its own — anything driven by an interval has to be replaced.
-        List<String> rearmed = plugin.reloadScheduledTasks();
+        // Hashing reads rewards.yml, so it runs off the main thread and the row is emitted from there.
+        // The actor and role are read here because the background task must not touch the sender or
+        // plugin state.
+        RewardConfig rewards = plugin.getRewardConfig();
+        UUID actorId = sender instanceof Entity entity ? entity.getUniqueId() : null;
+        String consoleName = actorId == null ? sender.getName() : null;
+        String role = plugin.getNetworkRole().name();
+        plugin.offMainThread(() -> {
+            String rewardsAfter = rewards == null ? null : rewards.refreshHash();
+            String configAfter = plugin.refreshConfigHash();
+            plugin.getAudit().emitAdmin(actorId, consoleName, "reload", AuditOutcome.COMMITTED, null,
+                    row -> row.risk(AuditRisk.HIGH).put("role", role)
+                            .put("rewards_sha256_before", rewardsBefore)
+                            .put("rewards_sha256_after", rewardsAfter)
+                            .put("rewards_changed", rewardsBefore != null && !rewardsBefore.equals(rewardsAfter))
+                            .put("config_sha256_before", configBefore)
+                            .put("config_sha256_after", configAfter)
+                            .put("config_changed", configBefore != null && !configBefore.equals(configAfter))
+                            .put("tasks_rearmed", String.join(",", rearmed)));
+        });
 
         sender.sendMessage(plugin.getLocaleManager().formatMessage("magic.commands.config_reloaded"));
 

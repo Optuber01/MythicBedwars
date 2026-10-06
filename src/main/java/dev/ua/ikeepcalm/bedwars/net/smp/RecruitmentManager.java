@@ -633,6 +633,26 @@ public class RecruitmentManager implements dev.ua.ikeepcalm.bedwars.net.EventPar
     }
 
     /**
+     * Records a newly added signup (the roster write has already succeeded). Never throws.
+     */
+    private void auditSignup(String eventId, UUID playerId, String playerName, int position) {
+        try {
+            plugin.getAudit().emit(dev.ua.ikeepcalm.bedwars.audit.BedwarsAuditEmitter.AuditRow
+                    .of("event.signup", dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome.COMMITTED)
+                    .correlation(dev.ua.ikeepcalm.bedwars.audit.BedwarsAuditEmitter.eventCorrelation(eventId))
+                    .business(eventId)
+                    .actor(playerId)
+                    .subject(playerId)
+                    .put("event_id", eventId)
+                    .put("player_name", playerName)
+                    .put("position", position)
+                    .put("cap", cap));
+        } catch (RuntimeException | LinkageError ignored) {
+            // Audit is best effort.
+        }
+    }
+
+    /**
      * Adds a player to the roster, from either the chat prompt or {@code /mb event join}.
      */
     public void join(Player player) {
@@ -653,6 +673,7 @@ public class RecruitmentManager implements dev.ua.ikeepcalm.bedwars.net.EventPar
 
                 switch (result.outcome()) {
                     case ADDED -> {
+                        auditSignup(eventId, playerId, player.getName(), result.position());
                         lastKnownCount = result.position();
                         player.sendMessage(plugin.getLocaleManager().formatMessage(
                                 "magic.event.signup.confirmed", "count", result.position(), "max", cap));
@@ -895,6 +916,15 @@ public class RecruitmentManager implements dev.ua.ikeepcalm.bedwars.net.EventPar
      * Cancels the in-flight event from this side.
      */
     public void cancel(CancelReason reason, Consumer<String> feedback) {
+        cancel(reason, feedback, null);
+    }
+
+    /**
+     * Same as {@link #cancel(CancelReason, Consumer)}. {@code onFailure}, when given, is told about a
+     * failure of the background store/bus calls on that background thread, and the failure then
+     * propagates exactly as it did before.
+     */
+    public void cancel(CancelReason reason, Consumer<String> feedback, Consumer<RuntimeException> onFailure) {
         String eventId = currentEventId;
         if (eventId == null) {
             feedback.accept("No event is in flight.");
@@ -902,10 +932,21 @@ public class RecruitmentManager implements dev.ua.ikeepcalm.bedwars.net.EventPar
         }
 
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
-            store.read(eventId).map(record -> record.cancelled(reason)).ifPresent(store::write);
-            network.bus().broadcast(NetworkRole.MINIGAME, MessageType.EVENT_CANCELLED, eventId,
-                    new Payloads.Cancelled(reason, network.serverId()));
-            store.retire(eventId);
+            try {
+                store.read(eventId).map(record -> record.cancelled(reason)).ifPresent(store::write);
+                network.bus().broadcast(NetworkRole.MINIGAME, MessageType.EVENT_CANCELLED, eventId,
+                        new Payloads.Cancelled(reason, network.serverId()));
+                store.retire(eventId);
+            } catch (RuntimeException failure) {
+                if (onFailure != null) {
+                    try {
+                        onFailure.accept(failure);
+                    } catch (RuntimeException ignored) {
+                        // The original failure is the one that matters.
+                    }
+                }
+                throw failure;
+            }
 
             Bukkit.getScheduler().runTask(plugin, () -> {
                 if (currentState == EventState.ANNOUNCED) {

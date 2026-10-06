@@ -96,6 +96,48 @@ public class RewardConfig {
         return value == null ? null : String.valueOf(value);
     }
 
+    /** Larger than any real rewards.yml; past it the file is not read just to be hashed. */
+    private static final long MAX_HASHED_BYTES = 4L * 1024 * 1024;
+
+    private volatile String contentHash;
+
+    /**
+     * @return the SHA-256 of rewards.yml as last hashed by {@link #refreshHash}, or {@code null} before that
+     */
+    public String contentHash() {
+        return contentHash;
+    }
+
+    /**
+     * Hashes rewards.yml as it is now and remembers the result. Reads the file, so call off the main
+     * thread.
+     *
+     * @return the SHA-256, {@code "oversized"} or {@code "unreadable"}
+     */
+    public String refreshHash() {
+        String hash = hashOf(new File(plugin.getDataFolder(), "rewards.yml"));
+        contentHash = hash;
+        return hash;
+    }
+
+    /**
+     * Reads the whole file, so call off the main thread.
+     *
+     * @return the SHA-256 of {@code file}, {@code "oversized"} or {@code "unreadable"}
+     */
+    public static String hashOf(File file) {
+        try {
+            if (file.length() > MAX_HASHED_BYTES) {
+                return "oversized";
+            }
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(java.nio.file.Files.readAllBytes(file.toPath()));
+            return java.util.HexFormat.of().formatHex(digest);
+        } catch (java.io.IOException | java.security.NoSuchAlgorithmException | RuntimeException e) {
+            return "unreadable";
+        }
+    }
+
     public void load() {
         File file = new File(plugin.getDataFolder(), "rewards.yml");
         if (!file.exists()) {

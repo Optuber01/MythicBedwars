@@ -11,6 +11,8 @@ import de.marcely.bedwars.api.event.arena.RoundEndEvent;
 import de.marcely.bedwars.api.event.player.PlayerKillPlayerEvent;
 import de.marcely.bedwars.api.event.player.PlayerQuitArenaEvent;
 import dev.ua.ikeepcalm.bedwars.MythicBedwars;
+import dev.ua.ikeepcalm.bedwars.audit.BedwarsAuditEmitter;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
 import dev.ua.ikeepcalm.bedwars.domain.reward.RewardService;
 import dev.ua.ikeepcalm.bedwars.net.protocol.source.ReturnOutcome;
 import org.bukkit.Bukkit;
@@ -214,6 +216,37 @@ public class EventArenaListener implements Listener {
     }
 
     /**
+     * Records who played with and against whom, so collusion between the same accounts is visible.
+     * Main thread; never throws.
+     */
+    private void auditMatchFinished(EventReservation reservation, Arena arena, Team winningTeam, boolean tie,
+                                    List<Player> winners, List<Player> losers,
+                                    List<UUID> quitWinners, List<UUID> quitLosers) {
+        try {
+            plugin.getAudit().emit(BedwarsAuditEmitter.AuditRow.of("event.match_finished", AuditOutcome.OBSERVED)
+                    .correlation(BedwarsAuditEmitter.eventCorrelation(reservation.eventId()))
+                    .business(reservation.eventId())
+                    .put("actor", "system")
+                    .put("event_id", reservation.eventId())
+                    .put("arena", arena.getName())
+                    .put("winning_team", winningTeam == null ? null : winningTeam.name())
+                    .put("tie", tie)
+                    .put("winner_count", winners.size())
+                    .put("loser_count", losers.size())
+                    .put("winners_list", ids(winners.stream().map(Player::getUniqueId).toList()))
+                    .put("losers_list", ids(losers.stream().map(Player::getUniqueId).toList()))
+                    .put("quit_winners_list", ids(quitWinners))
+                    .put("quit_losers_list", ids(quitLosers)));
+        } catch (RuntimeException | LinkageError ignored) {
+            // Audit is best effort.
+        }
+    }
+
+    private static String ids(List<UUID> players) {
+        return String.join(",", players.stream().map(UUID::toString).toList());
+    }
+
+    /**
      * The authoritative end of the match.
      *
      * <p>Everything that needs Beyonder context happens here, because the
@@ -247,6 +280,7 @@ public class EventArenaListener implements Listener {
                 reservation.eventId(), arena.getName(), winners.size(), losers.size(),
                 tie ? " (tie)" : "");
 
+        auditMatchFinished(reservation, arena, winningTeam, tie, winners, losers, quitWinners, quitLosers);
         rewards.payOut(reservation, arena, winners, losers, quitWinners, quitLosers, tie);
         orchestrator.publishFinished(reservation, arena, winningTeam, tie, winners, losers);
 

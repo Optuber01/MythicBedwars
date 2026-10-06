@@ -1,5 +1,6 @@
 package dev.ua.ikeepcalm.bedwars;
 
+import dev.ua.ikeepcalm.bedwars.audit.BedwarsAuditEmitter;
 import dev.ua.ikeepcalm.bedwars.cmd.CommandManager;
 import dev.ua.ikeepcalm.bedwars.cmd.impls.PlayerCommand;
 import dev.ua.ikeepcalm.bedwars.cmd.impls.MinigameSubcommands;
@@ -47,6 +48,7 @@ import org.bukkit.configuration.serialization.ConfigurationSerialization;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -91,6 +93,8 @@ public final class MythicBedwars extends JavaPlugin {
     private EventReturnService returnService;
     private RewardService rewardService;
     private RewardConfig rewardConfig;
+    private BedwarsAuditEmitter auditEmitter;
+    private volatile String configHash;
 
     public static MythicBedwars getInstance() {
         return instance;
@@ -127,8 +131,34 @@ public final class MythicBedwars extends JavaPlugin {
         return this.rewardService;
     }
 
+    /**
+     * @return the audit emitter; never null once {@code onEnable} has started, and a no-op when the
+     * shared audit client is unavailable
+     */
+    public BedwarsAuditEmitter getAudit() {
+        return auditEmitter;
+    }
+
     public RewardConfig getRewardConfig() {
         return this.rewardConfig;
+    }
+
+    /**
+     * @return the SHA-256 of config.yml as last hashed by {@link #refreshConfigHash}, or {@code null}
+     * before that
+     */
+    public String getConfigHash() {
+        return configHash;
+    }
+
+    /**
+     * Hashes config.yml as it is now and remembers the result. Reads the file, so call off the main
+     * thread.
+     */
+    public String refreshConfigHash() {
+        String hash = RewardConfig.hashOf(new File(getDataFolder(), "config.yml"));
+        configHash = hash;
+        return hash;
     }
 
     /**
@@ -248,6 +278,9 @@ public final class MythicBedwars extends JavaPlugin {
     public void onEnable() {
         instance = this;
 
+        // First, so every later subsystem (and an early disable) can rely on it being present.
+        auditEmitter = new BedwarsAuditEmitter(this);
+
         ConfigurationSerialization.registerClass(PathwayStats.class);
 
         configLoader = new ConfigLoader(this);
@@ -274,6 +307,8 @@ public final class MythicBedwars extends JavaPlugin {
 
         rewardConfig = new RewardConfig(this);
         rewardConfig.load();
+        offMainThread(rewardConfig::refreshHash);
+        offMainThread(this::refreshConfigHash);
 
         coiCapabilities = CoiCapabilities.probe(circleOfImaginationAPI, rewardConfig.actingSourceName());
         if (coiCapabilities.isDegraded()) {
@@ -689,6 +724,16 @@ public final class MythicBedwars extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        try {
+            shutdownSubsystems();
+        } finally {
+            if (auditEmitter != null) {
+                auditEmitter.close();
+            }
+        }
+    }
+
+    private void shutdownSubsystems() {
         if (eventSyncTask != null) {
             eventSyncTask.cancel();
             eventSyncTask = null;

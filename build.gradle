@@ -1,12 +1,14 @@
 plugins {
     id 'java'
     id("xyz.jpenilla.run-paper") version "2.3.1"
+    id('com.gradleup.shadow') version '9.4.1'
 }
 
 group = 'dev.ua.ikeepcalm'
 version = '1.3.0'
 
 repositories {
+    mavenLocal()
     mavenCentral()
     maven {
         url = "https://nexus.mysterria.net/repository/plugin-public/"
@@ -37,11 +39,25 @@ dependencies {
     compileOnly 'com.github.plan-player-analytics:Plan:5.6.2965'
     compileOnly("io.papermc.paper:paper-api:26.1.2.build.+")
     compileOnly 'de.marcely.bedwars:API:5.5.7'
-    // Present at runtime via plugin.yml `libraries:`, not bundled - there is no shadow plugin here.
+    // Present at runtime via plugin.yml `libraries:`, not bundled - only the audit client is shaded.
     compileOnly "redis.clients:jedis:${jedisVersion}"
     compileOnly "org.apache.commons:commons-pool2:${commonsPoolVersion}"
     compileOnly "org.xerial:sqlite-jdbc:${sqliteVersion}"
     compileOnly 'dev.ua.ikeepcalm:circle-of-imagination-api:1.4.9-SNAPSHOT'
+    // The one bundled dependency: the shared Mysterria audit client, shaded and relocated so
+    // another plugin's copy cannot clash with ours.
+    implementation 'dev.ua.ikeepcalm.mysterria:audit-client:1.0.2'
+}
+
+tasks.build.dependsOn tasks.shadowJar
+
+shadowJar {
+    archiveClassifier.set('')
+    relocate 'dev.ua.ikeepcalm.mysterria.audit', 'dev.ua.ikeepcalm.bedwars.libs.audit'
+}
+
+jar {
+    enabled = false
 }
 
 tasks {

@@ -3,6 +3,7 @@ package dev.ua.ikeepcalm.bedwars.cmd.impls;
 import de.marcely.bedwars.api.BedwarsAPI;
 import de.marcely.bedwars.api.arena.Arena;
 import dev.ua.ikeepcalm.bedwars.MythicBedwars;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.command.CommandSender;
@@ -125,6 +126,8 @@ public class MinigameSubcommands {
         boolean enable = "enable".equalsIgnoreCase(args[1]);
 
         plugin.getConfigManager().setArenaEnabled(arenaName, enable);
+        plugin.getAudit().emitAdmin(sender, enable ? "arena.enable" : "arena.disable", AuditOutcome.COMMITTED, null,
+                row -> row.put("arena", arenaName).put("action_arg", args[1]).put("enabled_after", enable));
         sender.sendMessage(plugin.getLocaleManager().formatMessage(
                 enable ? "magic.commands.arena_enabled" : "magic.commands.arena_disabled",
                 "arena", arenaName));
@@ -135,6 +138,8 @@ public class MinigameSubcommands {
             boolean current = plugin.getConfigManager().isPathwayBalancingEnabled();
             plugin.getConfigManager().getConfig().set("pathways.auto-balance", !current);
             plugin.saveConfig();
+            plugin.getAudit().emitAdmin(sender, "balance.toggle", AuditOutcome.COMMITTED, null,
+                    row -> row.put("auto_balance_before", current).put("auto_balance_after", !current));
 
             sender.sendMessage(plugin.getLocaleManager().formatMessage(
                     current ? "magic.commands.balance_disabled" : "magic.commands.balance_enabled"));
@@ -190,9 +195,13 @@ public class MinigameSubcommands {
                 if (disabledPathways.remove(pathway)) {
                     plugin.getConfigManager().getConfig().set("pathways.disabled", disabledPathways);
                     plugin.saveConfig();
+                    plugin.getAudit().emitAdmin(sender, "pathways.enable", AuditOutcome.COMMITTED, null,
+                            row -> row.put("pathway", pathway));
                     sender.sendMessage(plugin.getLocaleManager().formatMessage(
                             "magic.commands.pathway_enabled", "pathway", pathway));
                 } else {
+                    plugin.getAudit().emitAdmin(sender, "pathways.enable", AuditOutcome.DENIED, "already_enabled",
+                            row -> row.put("pathway", pathway));
                     sender.sendMessage(plugin.getLocaleManager().formatMessage(
                             "magic.commands.pathway_already_enabled", "pathway", pathway));
                 }
@@ -202,9 +211,13 @@ public class MinigameSubcommands {
                     disabledPathways.add(pathway);
                     plugin.getConfigManager().getConfig().set("pathways.disabled", disabledPathways);
                     plugin.saveConfig();
+                    plugin.getAudit().emitAdmin(sender, "pathways.disable", AuditOutcome.COMMITTED, null,
+                            row -> row.put("pathway", pathway));
                     sender.sendMessage(plugin.getLocaleManager().formatMessage(
                             "magic.commands.pathway_disabled", "pathway", pathway));
                 } else {
+                    plugin.getAudit().emitAdmin(sender, "pathways.disable", AuditOutcome.DENIED, "already_disabled",
+                            row -> row.put("pathway", pathway));
                     sender.sendMessage(plugin.getLocaleManager().formatMessage(
                             "magic.commands.pathway_already_disabled", "pathway", pathway));
                 }
