@@ -113,6 +113,13 @@ public final class RedisKeys {
     }
 
     /**
+     * The bundle popped for a player whose claim is not yet known, so it survives a restart.
+     */
+    public String rewardsParked(java.util.UUID playerId) {
+        return key("rewards", "parked", playerId.toString());
+    }
+
+    /**
      * Who has already been paid for an event; the emit-side guard against paying twice.
      */
     public String rewardsGranted(String eventId) {

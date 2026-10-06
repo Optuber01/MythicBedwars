@@ -51,6 +51,26 @@ public class RewardQueue {
             return 1
             """;
 
+    /**
+     * Pops the next bundle and parks it, with its claim token, in one step: until the claim is known
+     * the bundle is in Redis, not only in memory. {@code KEYS[1]} pending list, {@code KEYS[2]} parked
+     * key, {@code ARGV[1]} token, {@code ARGV[2]} ttl.
+     *
+     * <p>Returns 2 when a bundle was already parked (left alone), 1 when one was parked now,
+     * 0 when nothing is pending.
+     */
+    private static final String PARK = """
+            if redis.call('EXISTS', KEYS[2]) == 1 then return 2 end
+            local raw = redis.call('LPOP', KEYS[1])
+            if not raw then return 0 end
+            redis.call('SET', KEYS[2], ARGV[1] .. '\n' .. raw, 'EX', tonumber(ARGV[2]))
+            return 1
+            """;
+
+    /** A popped bundle and the token its claim is tried with. */
+    record Parked(RewardBundle bundle, String token) {
+    }
+
     /** What a {@link #claimAttempt} learned. */
     enum ClaimAttempt {
         CLAIMED,
@@ -98,25 +118,52 @@ public class RewardQueue {
     }
 
     /**
-     * Takes the next bundle for a player, if any. Does Redis I/O.
+     * Takes the next bundle for a player, if any, parking it in Redis until {@link #unpark}. A bundle
+     * already parked, such as one left by a restart, comes back first with the token it was claimed
+     * with. Does Redis I/O.
+     *
+     * @param token the claim token for a bundle parked now
      */
-    public Optional<RewardBundle> poll(UUID playerId) {
-        Optional<String> raw = client.lpop(keys.rewardsPending(playerId));
-        if (raw.isEmpty()) {
+    public Optional<Parked> park(UUID playerId, String token) {
+        String parkedKey = keys.rewardsParked(playerId);
+        long result = client.evalLong(PARK, List.of(keys.rewardsPending(playerId), parkedKey),
+                List.of(token, Integer.toString(config.queueTtlSeconds())), -1L);
+        if (result <= 0) {
             return Optional.empty();
         }
 
-        try {
-            RewardBundle bundle = gson.fromJson(raw.get(), RewardBundle.class);
-            if (bundle == null || bundle.schema() != RewardBundle.SCHEMA) {
-                quarantine(raw.get(), "unsupported schema");
-                return Optional.empty();
-            }
-            return Optional.of(bundle);
-        } catch (JsonSyntaxException exception) {
-            quarantine(raw.get(), exception.getMessage());
+        // A reply lost after a park is found by the next call, which answers 2.
+        Optional<String> stored = client.get(parkedKey);
+        if (stored.isEmpty()) {
             return Optional.empty();
         }
+
+        String value = stored.get();
+        int split = value.indexOf('\n');
+        String raw = split < 0 ? value : value.substring(split + 1);
+        try {
+            RewardBundle bundle = split < 0 ? null : gson.fromJson(raw, RewardBundle.class);
+            if (bundle == null || bundle.schema() != RewardBundle.SCHEMA) {
+                quarantine(raw, "unsupported schema");
+                unpark(playerId);
+                return Optional.empty();
+            }
+            return Optional.of(new Parked(bundle, value.substring(0, split)));
+        } catch (JsonSyntaxException exception) {
+            quarantine(raw, exception.getMessage());
+            unpark(playerId);
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Drops the parked bundle once its claim is known.
+     *
+     * @return {@code false} if Redis did not answer, leaving it parked
+     */
+    boolean unpark(UUID playerId) {
+        return client.evalLong("return redis.call('DEL', KEYS[1])", List.of(keys.rewardsParked(playerId)),
+                List.of(), -1L) >= 0;
     }
 
     /**

@@ -62,8 +62,8 @@ public class RewardRedeemer {
     private final RewardQueue queue;
 
     /**
-     * Bundles popped from Redis whose claim got no answer, one per player at most. Memory only: a
-     * restart before the retry loses them.
+     * Bundles popped from Redis whose claim got no answer, one per player at most. Each is also
+     * parked in Redis, so a restart before the retry finds it there.
      */
     private final Map<UUID, Unresolved> unresolved = new java.util.concurrent.ConcurrentHashMap<>();
     /**
@@ -202,15 +202,15 @@ public class RewardRedeemer {
 
             boolean kept = false;
             try {
-                RewardBundle bundle = queue.poll(playerId).orElse(null);
-                if (bundle == null) {
+                RewardQueue.Parked parked = queue.park(playerId, UUID.randomUUID().toString()).orElse(null);
+                if (parked == null) {
                     break;
                 }
 
-                Unresolved attempt = new Unresolved(bundle, UUID.randomUUID().toString());
+                Unresolved attempt = new Unresolved(parked.bundle(), parked.token());
                 if (!resolve(playerId, attempt, claimed)) {
-                    // Already popped, so Redis no longer has it: this copy is the only one until a
-                    // retry with the same token learns whether the claim landed. It keeps the permit.
+                    // Already popped, but parked in Redis too: a retry with the same token learns
+                    // whether the claim landed, even after a restart. It keeps the permit.
                     unresolved.put(playerId, attempt);
                     kept = true;
                     return;
@@ -234,14 +234,17 @@ public class RewardRedeemer {
             // Whether the claim landed is unknown, exactly as for a missing reply.
             return false;
         }
-        switch (result) {
-            case CLAIMED -> claimed.add(attempt.bundle());
-            // Somebody already applied this one; popping it was the cleanup.
-            case DUPLICATE -> {
-            }
-            case UNAVAILABLE -> {
-                return false;
-            }
+        if (result == RewardQueue.ClaimAttempt.UNAVAILABLE) {
+            return false;
+        }
+        // Parked until now: only once it is dropped may the bundle count as claimed, or a failed
+        // drop would leave a claimed bundle to be claimed and applied again.
+        if (!queue.unpark(playerId)) {
+            return false;
+        }
+        // A DUPLICATE was already applied by somebody else; dropping it was the cleanup.
+        if (result == RewardQueue.ClaimAttempt.CLAIMED) {
+            claimed.add(attempt.bundle());
         }
         return true;
     }
