@@ -13,9 +13,10 @@ import org.bukkit.Location;
 import org.bukkit.Sound;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
-import org.bukkit.plugin.IllegalPluginAccessException;
+import org.bukkit.scheduler.BukkitTask;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Applies queued rewards on the survival server, where the player's real Beyonder lives.
@@ -28,13 +29,13 @@ import java.util.*;
  * always succeeds.
  *
  * <p>Every grant is marked settled the moment its effect lands, so a failure partway through a
- * bundle re-queues exactly the grants that did not land, never the ones that did. The one effect
- * that can fail half-applied, the inventory hand-over, is settled before it runs instead: a grant
- * that may have landed is never re-queued, at the cost of losing it if it did not.
+ * bundle re-queues only the grants that did not land. The inventory hand-over, which can fail
+ * half-applied, is settled before it runs instead: a grant that may have landed is never re-queued,
+ * at the cost of losing it if it did not.
  *
- * <p>A bundle stays in Redis, parked under a lease no other server can take, from the moment it is
- * popped until it has been applied. It is marked as being applied just before the first grant, and
- * a mark left behind by a crash is reported to staff and never paid again.
+ * <p>A bundle stays in Redis, parked under a per-player lease, from the moment it is popped until it
+ * has been applied. It is marked as being applied just before the first grant, and a mark left
+ * behind by a crash is reported to staff and never paid again.
  */
 public class RewardRedeemer {
 
@@ -58,22 +59,18 @@ public class RewardRedeemer {
     /** How long a drain that could not finish waits before trying again, while the player stays online. */
     private static final long RETRY_DELAY_TICKS = 20L * 30;
 
+    private static final long HEARTBEAT_TICKS = 20L * 30;
+
     private final MythicBedwars plugin;
     private final RewardConfig config;
     private final RewardQueue queue;
 
-    /**
-     * Players with a drain under way here, from the lease to the last bundle settled. The lease in
-     * Redis keeps other servers out; this keeps a second drain here from taking the same bundle
-     * while the first is still applying it.
-     */
-    private final Set<UUID> draining = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    private final Set<UUID> retryScheduled = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** Players with a drain under way here, so a second drain cannot take a bundle still being applied. */
+    private final Set<UUID> draining = ConcurrentHashMap.newKeySet();
+    private final Set<UUID> retryScheduled = ConcurrentHashMap.newKeySet();
 
     /** Renews the lease of each drain under way, so a slow main-thread apply cannot outlive it. */
-    private final Map<UUID, org.bukkit.scheduler.BukkitTask> heartbeats = new java.util.concurrent.ConcurrentHashMap<>();
-
-    private static final long HEARTBEAT_TICKS = 20L * 30;
+    private final Map<UUID, BukkitTask> heartbeats = new ConcurrentHashMap<>();
 
     public RewardRedeemer(MythicBedwars plugin, RewardConfig config, RewardQueue queue) {
         this.plugin = plugin;
@@ -160,45 +157,24 @@ public class RewardRedeemer {
             }
 
             String drain = UUID.randomUUID().toString();
-            boolean leased = false;
-            try {
-                leased = queue.lease(playerId, drain);
-            } finally {
-                if (!leased) {
-                    draining.remove(playerId);
-                }
-            }
-            if (!leased) {
+            if (!queue.lease(playerId, drain)) {
+                draining.remove(playerId);
                 scheduleRetry(playerId);
                 return;
             }
 
-            startHeartbeat(playerId, drain);
+            heartbeats.put(playerId, Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, () -> {
+                if (!queue.renew(playerId, drain)) {
+                    plugin.log("Lost the reward lease for {} while it was held.", playerId);
+                }
+            }, HEARTBEAT_TICKS, HEARTBEAT_TICKS));
             advance(playerId, drain, 0);
         });
     }
 
-    /** Renews the lease every ~30s, off the main thread, until {@link #finish}. */
-    private void startHeartbeat(UUID playerId, String drain) {
-        try {
-            heartbeats.put(playerId, Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, () -> {
-                try {
-                    if (!queue.renew(playerId, drain)) {
-                        plugin.log("Lost the reward lease for {} while it was held.", playerId);
-                    }
-                } catch (RuntimeException exception) {
-                    plugin.log("Could not renew the reward lease for {}: {}", playerId,
-                            String.valueOf(exception.getMessage()));
-                }
-            }, HEARTBEAT_TICKS, HEARTBEAT_TICKS));
-        } catch (IllegalPluginAccessException disabled) {
-            // Shutting down: the lease lapses on its own.
-        }
-    }
-
     /** Ends a drain: stops its heartbeat and gives the lease up. */
     private void finish(UUID playerId, String drain) {
-        org.bukkit.scheduler.BukkitTask heartbeat = heartbeats.remove(playerId);
+        BukkitTask heartbeat = heartbeats.remove(playerId);
         if (heartbeat != null) {
             heartbeat.cancel();
         }
@@ -212,31 +188,25 @@ public class RewardRedeemer {
      * Redis until it has been dealt with.
      */
     private void advance(UUID playerId, String drain, int done) {
-        RewardBundle bundle = null;
-        boolean retry = false;
+        Taken taken = new Taken(null, false);
         try {
             if (done < config.maxBundlesPerJoin()) {
-                Taken taken = take(playerId, drain);
-                bundle = taken.bundle();
-                retry = taken.retry();
+                taken = take(playerId, drain);
             }
         } catch (RuntimeException exception) {
             plugin.log("Failed to take rewards for {}: {}", playerId, String.valueOf(exception.getMessage()));
-            retry = true;
-        } finally {
-            if (bundle == null) {
-                finish(playerId, drain);
-            }
+            taken = new Taken(null, true);
         }
 
-        if (bundle == null) {
-            if (retry) {
+        RewardBundle claimed = taken.bundle();
+        if (claimed == null) {
+            finish(playerId, drain);
+            if (taken.retry()) {
                 scheduleRetry(playerId);
             }
             return;
         }
 
-        RewardBundle claimed = bundle;
         Bukkit.getScheduler().runTask(plugin, () -> {
             List<RewardBundle> giveBack = List.of();
             try {
@@ -316,17 +286,13 @@ public class RewardRedeemer {
         if (!plugin.isEnabled() || !retryScheduled.add(playerId)) {
             return;
         }
-        try {
-            Bukkit.getScheduler().runTaskLater(plugin, () -> {
-                retryScheduled.remove(playerId);
-                Player online = Bukkit.getPlayer(playerId);
-                if (online != null) {
-                    drain(online);
-                }
-            }, RETRY_DELAY_TICKS);
-        } catch (IllegalPluginAccessException disabled) {
+        Bukkit.getScheduler().runTaskLater(plugin, () -> {
             retryScheduled.remove(playerId);
-        }
+            Player online = Bukkit.getPlayer(playerId);
+            if (online != null) {
+                drain(online);
+            }
+        }, RETRY_DELAY_TICKS);
     }
 
     /**
@@ -678,11 +644,6 @@ public class RewardRedeemer {
         return Math.max(1, (int) Math.round(needed * grant.amount() / 100.0));
     }
 
-    /**
-     * Places the items, then drops or re-queues what did not fit, and only then talks to the player.
-     * Doing every state change before any message means a failure while formatting cannot leave an
-     * item half-handled.
-     */
     private void giveItems(Redemption r, List<PendingItem> items) {
         if (items.isEmpty()) {
             return;
@@ -799,10 +760,7 @@ public class RewardRedeemer {
         r.giveBack().add(overflow);
     }
 
-    /**
-     * Drops a stack at the player. The grant is settled once the drop has been made, so a later
-     * failure does not hand the same stack over again.
-     */
+    /** Drops a stack and settles its grant, so a later failure does not hand it over again. */
     private void drop(Redemption r, PendingItem item, ItemStack stack, Location location) {
         r.player().getWorld().dropItem(location, stack);
         r.progress().settle(item.index());
@@ -830,12 +788,7 @@ public class RewardRedeemer {
         return plugin.getLocaleManager().formatMessage(player, key, args);
     }
 
-    // ---- state --------------------------------------------------------------------------------
-
-    /**
-     * What taking the next bundle came to: the bundle to apply, or none, with whether to try again
-     * later.
-     */
+    /** The bundle to apply, or none, and whether to try again later. */
     private record Taken(RewardBundle bundle, boolean retry) {
     }
 

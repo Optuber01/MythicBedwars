@@ -61,11 +61,10 @@ public class RewardQueue {
      * {@code KEYS[3]} drain lease, {@code ARGV[1]} drain, {@code ARGV[2]} token, {@code ARGV[3]} ttl,
      * {@code ARGV[4]} lease ttl, {@code ARGV[5]} now (ms), {@code ARGV[6]} grace (ms).
      *
-     * <p>Returns 4 when the parked bundle is being applied and its owner beat within the grace
-     * period (left alone, may still be alive), 3 when it is being applied and the beat is older than
-     * the grace period, so its drain died (left alone), 2 when a bundle was already parked (left
-     * alone), 1 when one was parked now, 0 when nothing is pending, -2 when the lease is not this
-     * drain's.
+     * <p>Returns 1 when a bundle is parked, now or earlier, 0 when nothing is pending, 2 when the
+     * parked bundle is being applied and its owner has not beat within the grace period, so its
+     * drain died (left alone), -2 when the lease is not this drain's or the parked bundle is being
+     * applied by an owner that beat within the grace period and may still be alive.
      */
     private static final String PARK = """
             if redis.call('GET', KEYS[3]) ~= ARGV[1] then return -2 end
@@ -73,10 +72,10 @@ public class RewardQueue {
             local state = redis.call('HGET', KEYS[2], 'state')
             if state == 'applying' then
               local beat = tonumber(redis.call('HGET', KEYS[2], 'beat') or '0') or 0
-              if tonumber(ARGV[5]) - beat > tonumber(ARGV[6]) then return 3 end
-              return 4
+              if tonumber(ARGV[5]) - beat > tonumber(ARGV[6]) then return 2 end
+              return -2
             end
-            if state then return 2 end
+            if state then return 1 end
             local raw = redis.call('LPOP', KEYS[1])
             if not raw then return 0 end
             redis.call('HSET', KEYS[2], 'state', 'parked', 'token', ARGV[2], 'bundle', raw)
@@ -144,6 +143,8 @@ public class RewardQueue {
 
     /** The outcome of a {@link #park}, with the bundle and the token its claim is tried with. */
     record Parked(ParkStatus status, RewardBundle bundle, String token) {
+        static final Parked EMPTY = new Parked(ParkStatus.EMPTY, null, null);
+        static final Parked UNAVAILABLE = new Parked(ParkStatus.UNAVAILABLE, null, null);
     }
 
     /** What a {@link #claimAttempt} learned. */
@@ -235,39 +236,35 @@ public class RewardQueue {
                 List.of(drain, token, Integer.toString(config.queueTtlSeconds()), Integer.toString(LEASE_SECONDS),
                         Long.toString(System.currentTimeMillis()), Long.toString(APPLYING_GRACE_MILLIS)),
                 -1L);
-        if (result < 0 || result == 4) {
-            // 4: being applied and heard from recently, so its drain may still be alive; wait.
-            return new Parked(ParkStatus.UNAVAILABLE, null, null);
+        if (result < 0) {
+            return Parked.UNAVAILABLE;
         }
         if (result == 0) {
-            return new Parked(ParkStatus.EMPTY, null, null);
+            return Parked.EMPTY;
         }
 
-        // A reply lost after a park is found by the next call, which answers 2.
         Map<String, String> stored = client.hgetAll(parkedKey);
         String raw = stored.get("bundle");
         if (raw == null) {
-            return new Parked(ParkStatus.EMPTY, null, null);
+            return Parked.EMPTY;
         }
 
         RewardBundle bundle = read(raw);
-        if (result == 3) {
-            plugin.getLogger().warning("Reward bundle " + (bundle == null ? "?" : bundle.eventId()) + " for "
-                    + (bundle == null ? playerId : bundle.playerName()) + " was being applied when the server "
-                    + "stopped, so it may be partly or not at all delivered. It will NOT be paid again; it was "
-                    + "moved to the dead letters (" + keys.rewardsDeadLetter() + ") for staff to check.");
-            quarantine(raw, "stuck while applying");
-            return unpark(playerId, drain, List.of())
-                    ? new Parked(ParkStatus.EMPTY, null, null)
-                    : new Parked(ParkStatus.UNAVAILABLE, null, null);
-        }
-        if (bundle == null) {
-            quarantine(raw, "unsupported schema or unreadable");
-            return unpark(playerId, drain, List.of())
-                    ? new Parked(ParkStatus.EMPTY, null, null)
-                    : new Parked(ParkStatus.UNAVAILABLE, null, null);
+        if (result == 2 || bundle == null) {
+            if (result == 2) {
+                warnStuck(bundle, playerId, "It was moved to the dead letters (" + keys.rewardsDeadLetter()
+                        + ") for staff to check.");
+            }
+            quarantine(raw, result == 2 ? "stuck while applying" : "unsupported schema or unreadable");
+            return unpark(playerId, drain, List.of()) ? Parked.EMPTY : Parked.UNAVAILABLE;
         }
         return new Parked(ParkStatus.PARKED, bundle, stored.get("token"));
+    }
+
+    private void warnStuck(RewardBundle bundle, Object who, String action) {
+        plugin.getLogger().warning("Reward bundle " + (bundle == null ? "?" : bundle.eventId()) + " for "
+                + (bundle == null ? who : bundle.playerName()) + " was being applied when the server "
+                + "stopped, so it may be partly or not at all delivered. It will NOT be paid again. " + action);
     }
 
     private RewardBundle read(String raw) {
@@ -317,11 +314,8 @@ public class RewardQueue {
             if (!"applying".equals(stored.get("state"))) {
                 continue;
             }
-            RewardBundle bundle = read(String.valueOf(stored.get("bundle")));
-            plugin.getLogger().warning("Reward bundle " + (bundle == null ? "?" : bundle.eventId()) + " for "
-                    + (bundle == null ? key : bundle.playerName()) + " was being applied when the server "
-                    + "stopped, so it may be partly or not at all delivered. It will NOT be paid again. "
-                    + "Staff: check the player, then delete " + key + ".");
+            warnStuck(read(String.valueOf(stored.get("bundle"))), key,
+                    "Staff: check the player, then delete " + key + ".");
         }
     }
 
