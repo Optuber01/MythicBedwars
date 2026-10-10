@@ -28,10 +28,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * is the one failure that has to be retried, and it must not block the half of the reward that
  * always succeeds.
  *
- * <p>Every grant is marked settled the moment its effect lands, so a failure partway through a
- * bundle re-queues only the grants that did not land. The inventory hand-over, which can fail
- * half-applied, is settled before it runs instead: a grant that may have landed is never re-queued,
- * at the cost of losing it if it did not.
+ * <p>Every grant is marked settled before its effect is requested, so a failure partway through
+ * a bundle re-queues only the grants that were never started. A Circle of Imagination call or the
+ * inventory hand-over can fail half-applied: a grant that may have landed is never re-queued, at
+ * the cost of losing it if it did not.
  *
  * <p>A bundle stays in Redis, parked under a per-player lease, from the moment it is popped until it
  * has been applied. It is marked as being applied just before the first grant, and a mark left
@@ -164,8 +164,12 @@ public class RewardRedeemer {
             }
 
             heartbeats.put(playerId, Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, () -> {
-                if (!queue.renew(playerId, drain)) {
-                    plugin.log("Lost the reward lease for {} while it was held.", playerId);
+                try {
+                    if (!queue.renew(playerId, drain)) {
+                        plugin.log("Lost the reward lease for {} while it was held.", playerId);
+                    }
+                } catch (RuntimeException exception) {
+                    plugin.log("Could not renew the reward lease for {}: {}", playerId, String.valueOf(exception.getMessage()));
                 }
             }, HEARTBEAT_TICKS, HEARTBEAT_TICKS));
             advance(playerId, drain, 0);
@@ -470,8 +474,9 @@ public class RewardRedeemer {
             return;
         }
 
-        int granted = r.api().grantActing(player, r.pathway(), r.capabilities().rewardSource(), points);
+        // Settled first: if the call throws after changing state, the grant must not be re-queued.
         r.progress().settle(index);
+        int granted = r.api().grantActing(player, r.pathway(), r.capabilities().rewardSource(), points);
         if (granted <= 0) {
             // Say so rather than dropping it silently - a reward that vanishes reads as a bug.
             r.summary().add(message(player, "magic.redeem.acting_capped"));
@@ -503,6 +508,7 @@ public class RewardRedeemer {
             return;
         }
 
+        r.progress().settle(index);
         long credited = r.api().creditActingCooldown(player, methodId, seconds);
         if (credited <= 0) {
             // Their method was already off cooldown, so there was nothing to shave. Paying the
@@ -512,7 +518,6 @@ public class RewardRedeemer {
             applyActing(r, index, withAmount(grant, config.cooldownSubstitutePercent()));
             return;
         }
-        r.progress().settle(index);
 
         long remaining = r.api().getActingCooldownRemaining(player.getUniqueId(), methodId);
         r.summary().add(message(player, "magic.redeem.cooldown_credited",
@@ -533,8 +538,8 @@ public class RewardRedeemer {
             return;
         }
 
-        r.api().setActingSpeedMultiplier(player, grant.amount(), grant.intArg() * 1000L);
         r.progress().settle(index);
+        r.api().setActingSpeedMultiplier(player, grant.amount(), grant.intArg() * 1000L);
         r.summary().add(message(player, "magic.redeem.speed_applied",
                 "percent", Math.round(grant.amount() * 100),
                 "duration", formatDuration(grant.intArg())));
@@ -548,8 +553,8 @@ public class RewardRedeemer {
             return;
         }
 
-        r.api().setActingItemMultiplier(player, grant.amount(), grant.intArg() * 1000L);
         r.progress().settle(index);
+        r.api().setActingItemMultiplier(player, grant.amount(), grant.intArg() * 1000L);
         r.summary().add(message(player, "magic.redeem.item_mult_applied",
                 "multiplier", multiplier(grant.amount()),
                 "duration", formatDuration(grant.intArg())));

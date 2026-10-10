@@ -246,16 +246,20 @@ public class RewardQueue {
         Map<String, String> stored = client.hgetAll(parkedKey);
         String raw = stored.get("bundle");
         if (raw == null) {
-            return Parked.EMPTY;
+            // Something is parked, so an empty read means the read failed, not that nothing is owed.
+            return Parked.UNAVAILABLE;
         }
 
         RewardBundle bundle = read(raw);
         if (result == 2 || bundle == null) {
+            // Only drop the parked copy once the dead letter is written; it is the only other copy.
+            if (!quarantine(raw, result == 2 ? "stuck while applying" : "unsupported schema or unreadable")) {
+                return Parked.UNAVAILABLE;
+            }
             if (result == 2) {
                 warnStuck(bundle, playerId, "It was moved to the dead letters (" + keys.rewardsDeadLetter()
                         + ") for staff to check.");
             }
-            quarantine(raw, result == 2 ? "stuck while applying" : "unsupported schema or unreadable");
             return unpark(playerId, drain, List.of()) ? Parked.EMPTY : Parked.UNAVAILABLE;
         }
         return new Parked(ParkStatus.PARKED, bundle, stored.get("token"));
@@ -391,9 +395,11 @@ public class RewardQueue {
 
     /**
      * Parks a payload nobody can read, rather than dropping it silently or crashing the login.
+     *
+     * @return {@code false} if it could not be written, in which case the caller must keep its copy
      */
-    private void quarantine(String payload, String reason) {
+    private boolean quarantine(String payload, String reason) {
         plugin.log("Quarantining unreadable reward payload ({}).", String.valueOf(reason));
-        client.rpushCapped(keys.rewardsDeadLetter(), payload, 200);
+        return client.rpushCapped(keys.rewardsDeadLetter(), payload, 200);
     }
 }
